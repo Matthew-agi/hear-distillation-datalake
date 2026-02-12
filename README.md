@@ -9,6 +9,7 @@ The primary driver is `datalake/run_lake.py`, which orchestrates streaming LAION
 - `stream_laion_audio_clips.py`: LAION-Audio streaming + shard writer.
 - `distill_hear_vit_s_canon2d.py`: student distillation training script.
 - `evaluate_distilled_hear.py`: downstream benchmark/evaluation on HF datasets.
+- `benchmark_student_vs_hear.py`: throughput benchmark for student (no projection head) vs full HeAR.
 - `datalake/README.md`: focused runner documentation.
 - Release scaffolding: `.env`, `.env.example`, `requirements.txt`, `.gitignore`.
 
@@ -59,6 +60,7 @@ Notes:
 - `stream_laion_audio_clips.py`
 - `distill_hear_vit_s_canon2d.py`
 - `evaluate_distilled_hear.py`
+- `benchmark_student_vs_hear.py`
 - `.env.example`
 - `.env` (local only)
 - `requirements.txt`
@@ -135,7 +137,7 @@ uv run python3 datalake/run_lake.py \
   --train-grad-accum 1 \
   --train-num-workers 4 \
   --stream-extra-args "--progress-every 100" \
-  --train-extra-args "--log-every 10 --val-fraction 0 --val-target-clips 10000 --val-defer-start-steps 10 --val-defer-check-every 10 --device cuda --max-steps 200000 --canon --canon-2d --canon-abcd --shuffle-shards --wandb --lr 3e-4 --val-batches 5 --val-every 250 --canon-no-pos-enc --resume-from checkpoints/hear_vit_s_lake/ckpt_013000.pt --lr-gns-adapt --lr-gns-ema-beta 0.995 --lr-gns-min-samples 100 --lr-gns-update-every 1000 --lr-gns-min-factor 0.1 --lr-gns-max-factor 1.0"
+  --train-extra-args "--log-every 10 --val-fraction 0 --val-target-clips 10000 --val-defer-start-steps 10 --val-defer-check-every 10 --device cuda --max-steps 200000 --canon --canon-2d --canon-abcd --shuffle-shards --wandb --lr 3e-4 --val-batches 5 --val-every 250 --canon-no-pos-enc --resume-from checkpoints/hear_vit_s_lake/ckpt_latest.pt --lr-gns-adapt --lr-gns-ema-beta 0.995 --lr-gns-min-samples 100 --lr-gns-update-every 1000 --lr-gns-min-factor 0.1 --lr-gns-max-factor 1.0"
 ```
 
 What this configuration does:
@@ -143,7 +145,7 @@ What this configuration does:
 - caps non-validation lake size at `60 GB` and resumes streaming near `30 GB` (`0.5`).
 - keeps reserve in a tighter working band (`100k` to `350k` clips).
 - uses larger training batches (`128`) for higher throughput.
-- resumes trainer weights from `ckpt_013000.pt`.
+- resumes trainer weights from a prior checkpoint.
 - enables EMA-smoothed GNS LR adaptation with conservative update cadence.
 
 ### 3) Evaluate Distilled Checkpoint
@@ -168,6 +170,26 @@ uv run python3 evaluate_distilled_hear.py \
   --batch-size 64 \
   --probe-backend sklearn
 ```
+
+### 5) Benchmark Student (No Projection Head) vs Full HeAR
+
+```bash
+uv run python3 benchmark_student_vs_hear.py \
+  --ckpt checkpoints/hear_vit_s_lake/ckpt_final.pt \
+  --hear-model-id google/hear-pytorch \
+  --device cuda \
+  --num-clips 128 \
+  --batch-size 128 \
+  --warmup 1 \
+  --repeats 5 \
+  --save-json results/benchmark_student_vs_hear.json
+```
+
+This benchmark reports:
+
+- student backbone embedding throughput using `student` features only (no `proj` head),
+- full HeAR `pooler_output` throughput,
+- relative model-only and end-to-end speedup ratios.
 
 Notes:
 
