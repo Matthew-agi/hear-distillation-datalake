@@ -1,0 +1,18 @@
+# Install torch separately (CPU vs CUDA wheel is environment-specific).
+# Example CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu124
+# Example CPU:  pip install torch
+
+numpy
+scipy
+soundfile
+
+datasets
+huggingface_hub
+transformers
+hf_transfer
+
+timm
+scikit-learn
+
+# Optional logging
+wandb

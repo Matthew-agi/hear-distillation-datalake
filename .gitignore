@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Secrets
+.env
+
+# Artifacts
+data/
+cache/
+checkpoints/
+wandb/
+*.pt
+*.npy
+*.npz
+*.tar
+*.tmp
+
+# Keep template env in repo
+!.env.example
