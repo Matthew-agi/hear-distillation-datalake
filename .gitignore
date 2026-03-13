@@ -17,6 +17,7 @@ cache/
 checkpoints/
 wandb/
 results/
+docs/
 *.pt
 *.npy
 *.npz

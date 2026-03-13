@@ -30,6 +30,7 @@ Example:
 """
 
 import argparse
+from collections import deque
 import io
 import json
 import math
@@ -40,7 +41,7 @@ import tarfile
 import time
 import contextlib
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Deque, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -130,13 +131,13 @@ def _iter_tar_pairs(tar_path: Path) -> Iterator[Tuple[bytes, Dict]]:
         stem, ext = os.path.splitext(name)
         if ext not in (".wav", ".json"):
           continue
-        f = tf.extractfile(member)
-        if f is None:
+        extracted = tf.extractfile(member)
+        if extracted is None:
           continue
         try:
-          data = f.read()
+          data = extracted.read()
         except Exception:
-          # Most commonly truncated tar shards; skip remaining entries in this shard.
+          # Most commonly truncated tar shards; skip the rest of this shard.
           return
         entry = pending.setdefault(stem, {})
         entry[ext] = data
@@ -149,6 +150,77 @@ def _iter_tar_pairs(tar_path: Path) -> Iterator[Tuple[bytes, Dict]]:
           pending.pop(stem, None)
   except tarfile.TarError:
     return
+
+
+def _iter_selected_tar_pairs(tar_path: Path, allowed_stems: Set[str]) -> Iterator[Tuple[bytes, Dict]]:
+  if not allowed_stems:
+    return
+  try:
+    tf = tarfile.open(tar_path, mode="r")
+  except FileNotFoundError:
+    return
+  except tarfile.TarError:
+    return
+  try:
+    with tf:
+      pending: Dict[str, Dict[str, bytes]] = {}
+      for member in tf:
+        if not member.isfile():
+          continue
+        name = Path(member.name).name
+        stem, ext = os.path.splitext(name)
+        if stem not in allowed_stems or ext not in (".wav", ".json"):
+          continue
+        f = tf.extractfile(member)
+        if f is None:
+          continue
+        try:
+          data = f.read()
+        except Exception:
+          return
+        entry = pending.setdefault(stem, {})
+        entry[ext] = data
+        if ".wav" in entry and ".json" in entry:
+          try:
+            meta = json.loads(entry[".json"].decode("utf-8", "replace"))
+          except Exception:
+            meta = {}
+          yield entry[".wav"], meta
+          pending.pop(stem, None)
+  except tarfile.TarError:
+    return
+
+
+def _load_manifest_entry_groups(manifest_path: Path) -> List[Tuple[Path, Set[str]]]:
+  if not manifest_path.exists():
+    return []
+  try:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+  except Exception:
+    return []
+  if not isinstance(payload, dict):
+    return []
+  raw_entries = payload.get("entries")
+  if not isinstance(raw_entries, list):
+    return []
+  grouped: Dict[str, Set[str]] = {}
+  for item in raw_entries:
+    if not isinstance(item, dict):
+      continue
+    tar_path_raw = item.get("tar_path")
+    stem = item.get("stem")
+    if not isinstance(tar_path_raw, str) or not isinstance(stem, str) or not stem:
+      continue
+    try:
+      tar_path = str(Path(tar_path_raw).resolve())
+    except Exception:
+      continue
+    grouped.setdefault(tar_path, set()).add(stem)
+  out: List[Tuple[Path, Set[str]]] = []
+  for tar_path, stems in grouped.items():
+    out.append((Path(tar_path), stems))
+  out.sort(key=lambda item: str(item[0]))
+  return out
 
 
 def _discover_shards(data_dir: Path, shards_glob: str, streams_glob: str) -> List[Path]:
@@ -340,6 +412,81 @@ class ClipDataset(IterableDataset):
         break
 
 
+class ManifestClipDataset(IterableDataset):
+  def __init__(
+    self,
+    manifest_path: Path,
+    *,
+    clip_samples: int,
+    sample_rate: int,
+    shuffle_shards: bool,
+    seed: int,
+    repeat: bool,
+    refresh_interval_sec: float,
+  ) -> None:
+    super().__init__()
+    self.manifest_path = Path(manifest_path)
+    self.clip_samples = int(clip_samples)
+    self.sample_rate = int(sample_rate)
+    self.shuffle_shards = bool(shuffle_shards)
+    self.seed = int(seed)
+    self.repeat = bool(repeat)
+    self.refresh_interval_sec = float(max(1.0, refresh_interval_sec))
+    self._last_refresh_t = 0.0
+    self._groups: List[Tuple[Path, Set[str]]] = []
+
+  def _current_groups(self) -> List[Tuple[Path, Set[str]]]:
+    now = time.time()
+    if (not self._groups) or ((now - self._last_refresh_t) >= self.refresh_interval_sec):
+      self._groups = _load_manifest_entry_groups(self.manifest_path)
+      self._last_refresh_t = now
+    return self._groups
+
+  def __iter__(self):
+    worker = get_worker_info()
+    if worker is None:
+      worker_id = 0
+      num_workers = 1
+    else:
+      worker_id = worker.id
+      num_workers = worker.num_workers
+
+    rng = random.Random(self.seed + worker_id)
+
+    while True:
+      all_groups = self._current_groups()
+      group_list = all_groups[worker_id::num_workers]
+      if not group_list:
+        time.sleep(min(2.0, self.refresh_interval_sec))
+        if not self.repeat:
+          break
+        continue
+      order = list(group_list)
+      if self.shuffle_shards:
+        rng.shuffle(order)
+
+      for shard_path, allowed_stems in order:
+        try:
+          for wav_bytes, _meta in _iter_selected_tar_pairs(shard_path, allowed_stems):
+            audio = _decode_wav_bytes(wav_bytes, self.sample_rate)
+            if audio is None:
+              continue
+
+            if audio.numel() < self.clip_samples:
+              pad = self.clip_samples - audio.numel()
+              audio = torch.nn.functional.pad(audio, (0, pad))
+            elif audio.numel() > self.clip_samples:
+              start = rng.randint(0, audio.numel() - self.clip_samples)
+              audio = audio[start : start + self.clip_samples]
+
+            yield audio
+        except (tarfile.TarError, FileNotFoundError, OSError):
+          continue
+
+      if not self.repeat:
+        break
+
+
 def _parse_args() -> argparse.Namespace:
   ap = argparse.ArgumentParser(description="Distill HeAR into a ViT-S student.")
   ap.add_argument("--data-dir", type=Path, default=Path("data/laion_audio_2s"), help="Directory with shard-*.tar files.")
@@ -352,10 +499,55 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
   ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device.")
   ap.add_argument("--lr", type=float, default=3e-5, help="Learning rate.")
-  ap.add_argument("--lr-schedule", type=str, default="none", choices=["none", "cosine"], help="LR schedule.")
+  ap.add_argument("--lr-schedule", type=str, default="none", choices=["none", "cosine", "linear"], help="LR schedule.")
+  ap.add_argument("--lr-schedule-start-step", type=int, default=0, help="Global step at which LR scheduling begins (used for resumed phase-local decay).")
   ap.add_argument("--lr-warmup-steps", type=int, default=0, help="Linear warmup steps for LR.")
   ap.add_argument("--lr-min-ratio", type=float, default=0.1, help="Final LR ratio for cosine schedule.")
-  ap.add_argument("--lr-gns-adapt", action="store_true", help="Adapt LR using GNS-estimated optimal batch size.")
+  ap.add_argument("--auto-warmup", action="store_true", help="Enable automatic LR and batch warmup.")
+  ap.add_argument("--auto-warmup-init-lr", type=float, default=0.0, help="Initial LR for auto warmup (<=0 uses 0.01 * --lr).")
+  ap.add_argument("--auto-warmup-probe-batch-size", type=int, default=0, help="Initial probe batch size for auto warmup (<=0 uses max(8, batch_size//4)).")
+  ap.add_argument("--auto-warmup-steps", type=int, default=1000, help="Number of warmup steps when --auto-warmup is enabled.")
+  ap.add_argument("--auto-warmup-metric-every", type=int, default=5, help="Warmup metric cadence in steps.")
+  ap.add_argument("--auto-warmup-lr-safety-frac", type=float, default=0.8, help="Safety fraction applied to estimated critical LR.")
+  ap.add_argument("--auto-warmup-ema-beta", type=float, default=0.9, help="EMA beta for auto-warmup LR smoothing.")
+  ap.add_argument("--auto-warmup-cbs-ema-beta", type=float, default=0.995, help="EMA beta for auto-warmup CBS smoothing.")
+  ap.add_argument(
+    "--gns-batch-window",
+    type=int,
+    default=9,
+    help="Recent raw CBS window used for distribution-aware batch selection.",
+  )
+  ap.add_argument(
+    "--gns-batch-target-utility",
+    type=float,
+    default=0.5,
+    help="Target fraction of asymptotic large-batch utility used to select a CBS-controlled batch.",
+  )
+  ap.add_argument(
+    "--batch-opt-mult",
+    type=float,
+    default=1.0,
+    help="Multiplier applied to the selected CBS when choosing runtime batch size.",
+  )
+  ap.add_argument(
+    "--batch-opt-oom-buffer-frac",
+    type=float,
+    default=0.10,
+    help="Free-memory headroom fraction used for near-OOM and OOM batch-opt backoff.",
+  )
+  ap.add_argument("--auto-warmup-lr-outlier-factor", type=float, default=4.0, help="Clamp LR critical-LR samples to this multiplicative factor around the LR EMA before updating it.")
+  ap.add_argument("--auto-warmup-cbs-outlier-factor", type=float, default=4.0, help="Clamp CBS samples to this multiplicative factor around the CBS EMA before updating it.")
+  ap.add_argument("--auto-warmup-batch-round-to", type=int, default=8, help="Round auto-warmup batch updates down to this multiple.")
+  ap.add_argument("--auto-warmup-max-lr", type=float, default=0.0, help="Optional hard cap on auto-warmup LR (<=0 disables cap).")
+  ap.add_argument("--auto-warmup-max-batch-size", type=int, default=0, help="Optional hard cap on auto-warmup batch size (<=0 disables cap).")
+  ap.add_argument(
+    "--lr-gns-mode",
+    type=str,
+    default="stable",
+    choices=["stable", "sqrt"],
+    help="Post-warmup LR policy: keep LR stable or use sqrt GNS adaptation.",
+  )
+  ap.add_argument("--lr-gns-adapt", action="store_true", help="Deprecated alias for --lr-gns-mode sqrt.")
   ap.add_argument("--lr-gns-ema-beta", type=float, default=0.99, help="EMA beta for GNS optimal batch smoothing.")
   ap.add_argument("--lr-gns-min-samples", type=int, default=20, help="Minimum GNS samples before LR adaptation starts.")
   ap.add_argument("--lr-gns-update-every", type=int, default=50, help="LR adaptation cadence in steps.")
@@ -363,6 +555,41 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--lr-gns-max-factor", type=float, default=1.0, help="Maximum LR factor from GNS adaptation.")
   ap.add_argument("--lr-gns-ref-batch", type=float, default=0.0, help="Reference batch for LR adaptation (<=0 uses batch_size*grad_accum).")
   ap.add_argument("--weight-decay", type=float, default=0.05, help="Weight decay.")
+  ap.add_argument(
+    "--compile-teacher",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Compile the teacher forward path with torch.compile.",
+  )
+  ap.add_argument(
+    "--compile-student",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Compile the student+projection+loss path with torch.compile.",
+  )
+  ap.add_argument("--compile-mode", type=str, default="default", help="torch.compile mode.")
+  ap.add_argument(
+    "--compile-dynamic",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Enable dynamic-shape torch.compile to reduce recompiles from batch changes.",
+  )
+  ap.add_argument(
+    "--fused-adamw",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Use fused AdamW on CUDA when available.",
+  )
+  ap.add_argument(
+    "--optimizer-mode",
+    type=str,
+    default="default",
+    choices=["default", "diagnostic", "teacher-superbatch"],
+    help="Training loop mode: baseline, timing diagnostics, or teacher-side superbatching.",
+  )
+  ap.add_argument("--optimizer-log-every", type=int, default=50, help="Log optimizer / timing diagnostics every N steps.")
+  ap.add_argument("--teacher-batch-factor", type=int, default=1, help="Number of student microbatches to group into one teacher pass.")
+  ap.add_argument("--teacher-max-batch", type=int, default=0, help="Optional cap on the total teacher batch size (0 disables cap).")
   ap.add_argument("--log-every", type=int, default=50, help="Log every N steps.")
   ap.add_argument("--save-every", type=int, default=1000, help="Checkpoint every N steps.")
   ap.add_argument("--max-checkpoints", type=int, default=20, help="Max numeric checkpoints to keep (0 disables pruning).")
@@ -404,6 +631,19 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--canon-post", action="store_true", help="(Deprecated) Use --canon-c instead.")
   ap.add_argument("--canon-causal", action="store_true", help="Use causal padding in Canon layer (time axis for 2D).")
   ap.add_argument("--val-fraction", type=float, default=0.001, help="Fraction of shards for validation (default 0.05).")
+  ap.add_argument("--val-manifest", type=Path, default=None, help="Optional orchestrator-managed validation manifest.")
+  ap.add_argument(
+    "--val-live-refresh",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Refresh orchestrator-managed validation manifest during training.",
+  )
+  ap.add_argument(
+    "--val-shard-refresh-sec",
+    type=float,
+    default=30.0,
+    help="Seconds between validation manifest refreshes when --val-manifest is set.",
+  )
   ap.add_argument("--val-shards-file", type=Path, default=None, help="Optional path to write selected validation shard paths as JSON.")
   ap.add_argument(
     "--val-target-clips",
@@ -959,6 +1199,124 @@ class _NoopScaler:
     return False
 
 
+def _teacher_targets_from_spec(
+  teacher: nn.Module,
+  spec: torch.Tensor,
+  *,
+  teacher_autocast_ctx,
+) -> torch.Tensor:
+  # `torch.compile` + AOT autograd cannot save inference tensors for backward.
+  # Use `no_grad()` here so teacher targets stay non-grad tensors without the
+  # stricter inference-tensor semantics.
+  with torch.no_grad():
+    with teacher_autocast_ctx():
+      return teacher(spec, return_dict=True).pooler_output.detach()
+
+
+class _StepTimer:
+  def __init__(self, *, device: torch.device, enabled: bool) -> None:
+    self.device = device
+    self.enabled = bool(enabled)
+    self.cuda_enabled = bool(self.enabled and device.type == "cuda")
+    self._starts: Dict[str, object] = {}
+    self._pairs: Dict[str, List[Tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+    self._totals_ms: Dict[str, float] = {}
+
+  def start(self, name: str) -> None:
+    if not self.enabled:
+      return
+    if self.cuda_enabled:
+      evt = torch.cuda.Event(enable_timing=True)
+      evt.record()
+      self._starts[name] = evt
+    else:
+      self._starts[name] = time.perf_counter()
+
+  def stop(self, name: str) -> None:
+    if not self.enabled:
+      return
+    start = self._starts.pop(name, None)
+    if start is None:
+      return
+    if self.cuda_enabled:
+      end = torch.cuda.Event(enable_timing=True)
+      end.record()
+      self._pairs.setdefault(name, []).append((start, end))  # type: ignore[arg-type]
+    else:
+      elapsed_ms = (time.perf_counter() - float(start)) * 1000.0
+      self._totals_ms[name] = self._totals_ms.get(name, 0.0) + elapsed_ms
+
+  def add_ms(self, name: str, elapsed_ms: float) -> None:
+    if (not self.enabled) or (not math.isfinite(elapsed_ms)):
+      return
+    self._totals_ms[name] = self._totals_ms.get(name, 0.0) + float(elapsed_ms)
+
+  def finish(self) -> Dict[str, float]:
+    if not self.enabled:
+      return {}
+    if self.cuda_enabled:
+      torch.cuda.synchronize()
+      for name, pairs in self._pairs.items():
+        total = self._totals_ms.get(name, 0.0)
+        for start, end in pairs:
+          total += float(start.elapsed_time(end))
+        self._totals_ms[name] = total
+    out = dict(self._totals_ms)
+    self._starts.clear()
+    self._pairs.clear()
+    self._totals_ms.clear()
+    return out
+
+
+class _PerfWindow:
+  def __init__(self) -> None:
+    self.count = 0
+    self.totals: Dict[str, float] = {}
+
+  def add(self, metrics: Dict[str, float]) -> None:
+    if not metrics:
+      return
+    self.count += 1
+    for key, value in metrics.items():
+      if not math.isfinite(value):
+        continue
+      self.totals[key] = self.totals.get(key, 0.0) + float(value)
+
+  def means(self) -> Dict[str, float]:
+    if self.count <= 0:
+      return {}
+    denom = float(self.count)
+    return {key: (value / denom) for key, value in self.totals.items()}
+
+  def reset(self) -> None:
+    self.count = 0
+    self.totals.clear()
+
+
+def _classify_perf_bottleneck(metrics: Dict[str, float]) -> str:
+  step_ms = float(metrics.get("step_ms", 0.0))
+  if step_ms <= 0.0:
+    return "unknown"
+  input_ms = float(metrics.get("loader_wait_ms", 0.0) + metrics.get("h2d_ms", 0.0) + metrics.get("preprocess_ms", 0.0))
+  teacher_ms = float(metrics.get("teacher_ms", 0.0))
+  student_ms = float(metrics.get("student_fwd_ms", 0.0) + metrics.get("backward_ms", 0.0) + metrics.get("optim_ms", 0.0))
+  aux_ms = float(metrics.get("aux_ms", 0.0))
+  dominant = max(input_ms, teacher_ms, student_ms, aux_ms)
+  if dominant < (0.35 * step_ms):
+    return "mixed"
+  if dominant == teacher_ms:
+    return "teacher_bound"
+  if dominant == input_ms:
+    return "input_bound"
+  if dominant == student_ms:
+    return "student_bound"
+  return "aux_bound"
+
+
+def _scalar_to_float(x: torch.Tensor) -> float:
+  return float(x.detach().float().cpu().item())
+
+
 def _set_lr(optim: torch.optim.Optimizer, lr: float) -> None:
   for group in optim.param_groups:
     group["lr"] = float(lr)
@@ -983,7 +1341,534 @@ def _lr_multiplier(
     progress = min(1.0, max(0.0, float(step - warmup_steps) / float(denom)))
     cos_term = 0.5 * (1.0 + math.cos(math.pi * progress))
     return float(min_ratio + (1.0 - min_ratio) * cos_term)
+  if schedule == "linear":
+    if max_steps <= warmup_steps + 1:
+      return 0.0
+    denom = max(1, max_steps - warmup_steps - 1)
+    progress = min(1.0, max(0.0, float(step - warmup_steps - 1) / float(denom)))
+    return float(max(0.0, 1.0 - progress))
   return 1.0
+
+
+def _weighted_distill_loss(
+  student_emb: torch.Tensor,
+  teacher_emb: torch.Tensor,
+  *,
+  temperature: float,
+  loss_mse_weight: float,
+  loss_contrastive_weight: float,
+  loss_relational_weight: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  loss_mse = F.mse_loss(student_emb, teacher_emb)
+  loss_con = _contrastive_loss(student_emb, teacher_emb, temperature=temperature)
+  loss_rel = _relational_loss(student_emb, teacher_emb)
+  loss_total = (
+    loss_mse_weight * loss_mse
+    + loss_contrastive_weight * loss_con
+    + loss_relational_weight * loss_rel
+  )
+  return loss_total, loss_mse, loss_con, loss_rel
+
+
+class _StudentLossWrapper(nn.Module):
+  def __init__(
+    self,
+    *,
+    student: nn.Module,
+    proj: nn.Module,
+    temperature: float,
+    loss_mse_weight: float,
+    loss_contrastive_weight: float,
+    loss_relational_weight: float,
+  ) -> None:
+    super().__init__()
+    self.student = student
+    self.proj = proj
+    self.temperature = float(temperature)
+    self.loss_mse_weight = float(loss_mse_weight)
+    self.loss_contrastive_weight = float(loss_contrastive_weight)
+    self.loss_relational_weight = float(loss_relational_weight)
+
+  def forward(
+    self,
+    spec: torch.Tensor,
+    teacher_emb: torch.Tensor,
+  ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    student_feats = _student_features(self.student, spec)
+    student_emb = self.proj(student_feats)
+    loss_total, loss_mse, loss_con, loss_rel = _weighted_distill_loss(
+      student_emb,
+      teacher_emb,
+      temperature=self.temperature,
+      loss_mse_weight=self.loss_mse_weight,
+      loss_contrastive_weight=self.loss_contrastive_weight,
+      loss_relational_weight=self.loss_relational_weight,
+    )
+    return loss_total, loss_mse, loss_con, loss_rel, student_emb
+
+
+def _make_data_loader(
+  ds: IterableDataset,
+  *,
+  batch_size: int,
+  num_workers: int,
+  pin_memory: bool,
+  drop_last: bool,
+) -> DataLoader:
+  kwargs = {
+    "batch_size": int(batch_size),
+    "num_workers": int(num_workers),
+    "pin_memory": bool(pin_memory),
+    "drop_last": bool(drop_last),
+  }
+  if int(num_workers) > 0:
+    kwargs["prefetch_factor"] = 2
+  return DataLoader(ds, **kwargs)
+
+
+def _round_batch_size_down(value: float, multiple: int) -> int:
+  mult = max(1, int(multiple))
+  if not math.isfinite(value) or value <= 0:
+    return 1
+  rounded = int(math.floor(float(value) / float(mult))) * mult
+  if rounded > 0:
+    return rounded
+  return max(1, int(math.floor(float(value))))
+
+
+def _sanitize_positive_float_window(
+  values: Sequence[float],
+  *,
+  max_len: int,
+) -> List[float]:
+  cleaned: List[float] = []
+  for raw_value in values:
+    try:
+      value = float(raw_value)
+    except Exception:
+      continue
+    if (not math.isfinite(value)) or value <= 0.0:
+      continue
+    cleaned.append(value)
+  if max_len <= 0:
+    return []
+  return cleaned[-max_len:]
+
+
+def _mean_large_batch_utility(
+  batch_size: float,
+  crit_batches: Sequence[float],
+) -> float:
+  valid = _sanitize_positive_float_window(crit_batches, max_len=max(1, len(crit_batches)))
+  if not valid:
+    return float("nan")
+  batch = max(float(batch_size), 1e-12)
+  total = 0.0
+  for crit_batch in valid:
+    total += batch / (batch + max(float(crit_batch), 1e-12))
+  return total / float(len(valid))
+
+
+def _expected_step_speedup_from_batches(
+  *,
+  crit_batches: Sequence[float],
+  baseline_batch: float,
+  candidate_batch: float,
+) -> Optional[float]:
+  if (not math.isfinite(baseline_batch)) or baseline_batch <= 0.0:
+    return None
+  if (not math.isfinite(candidate_batch)) or candidate_batch <= 0.0:
+    return None
+  baseline_utility = _mean_large_batch_utility(float(baseline_batch), crit_batches)
+  candidate_utility = _mean_large_batch_utility(float(candidate_batch), crit_batches)
+  if (
+    (not math.isfinite(baseline_utility))
+    or (not math.isfinite(candidate_utility))
+    or baseline_utility <= 0.0
+  ):
+    return None
+  return float(candidate_utility / baseline_utility)
+
+
+def _select_cbs_from_recent_window(
+  crit_batches: Sequence[float],
+  *,
+  target_utility: float,
+  max_batch: Optional[float] = None,
+) -> Optional[float]:
+  valid = _sanitize_positive_float_window(crit_batches, max_len=max(1, len(crit_batches)))
+  if not valid:
+    return None
+  target = min(1.0 - 1e-6, max(1e-6, float(target_utility)))
+  lower = 1.0
+  upper = max(valid)
+  if target < 1.0:
+    upper = max(upper, (target / max(1e-6, 1.0 - target)) * max(valid))
+  if max_batch is not None and math.isfinite(max_batch) and max_batch > 0.0:
+    upper = min(upper, float(max_batch))
+  upper = max(lower, upper)
+  if _mean_large_batch_utility(lower, valid) >= target:
+    return lower
+  if _mean_large_batch_utility(upper, valid) < target:
+    return upper
+  lo = lower
+  hi = upper
+  for _ in range(48):
+    mid = 0.5 * (lo + hi)
+    util = _mean_large_batch_utility(mid, valid)
+    if not math.isfinite(util):
+      return None
+    if util >= target:
+      hi = mid
+    else:
+      lo = mid
+  return hi
+
+
+def _resolve_batch_goal_from_cbs(
+  selected_cbs: Optional[float],
+  *,
+  batch_opt_mult: float,
+  round_to: int,
+  gpu_batch_cap: Optional[int],
+  max_batch_size: Optional[int],
+) -> Tuple[Optional[int], Optional[float]]:
+  if selected_cbs is None or (not math.isfinite(selected_cbs)) or selected_cbs <= 0.0:
+    return None, None
+  effective_cbs = float(selected_cbs) * max(1.0, float(batch_opt_mult))
+  batch_goal = _round_batch_size_down(effective_cbs, round_to)
+  if gpu_batch_cap is not None:
+    batch_goal = min(batch_goal, int(gpu_batch_cap))
+  if max_batch_size is not None:
+    batch_goal = min(batch_goal, int(max_batch_size))
+  batch_goal = max(1, batch_goal)
+  return int(batch_goal), float(effective_cbs)
+
+
+def _ramp_warmup_lr(
+  current_lr: float,
+  lr_goal: float,
+  *,
+  step: int,
+  warmup_steps: int,
+  metric_every: int,
+) -> float:
+  if (not math.isfinite(current_lr)) or current_lr <= 0.0:
+    current_lr = 1e-8
+  if (not math.isfinite(lr_goal)) or lr_goal <= 0.0:
+    return current_lr
+  updates_left = max(1, int(math.ceil(float(max(1, warmup_steps) - int(step)) / float(max(1, metric_every)))))
+  return current_lr + ((lr_goal - current_lr) / float(updates_left))
+
+
+def _filter_positive_ema_sample(
+  value: float,
+  ema_value: Optional[float],
+  *,
+  outlier_factor: float,
+) -> float:
+  if (not math.isfinite(value)) or value <= 0.0:
+    return value
+  if ema_value is None or (not math.isfinite(ema_value)) or ema_value <= 0.0:
+    return value
+  factor = max(1.0, float(outlier_factor))
+  if factor <= 1.0:
+    return value
+  lower = float(ema_value) / factor
+  upper = float(ema_value) * factor
+  return min(max(float(value), lower), upper)
+
+
+def _theil_sen_log_slope(
+  crit_points: Sequence[Tuple[int, float]],
+) -> Optional[float]:
+  points: List[Tuple[int, float]] = []
+  for raw_step, raw_value in crit_points:
+    try:
+      step = int(raw_step)
+      value = float(raw_value)
+    except Exception:
+      continue
+    if (not math.isfinite(value)) or value <= 0.0:
+      continue
+    points.append((step, math.log(max(value, 1e-12))))
+  if len(points) < 2:
+    return None
+  slopes: List[float] = []
+  for i in range(len(points) - 1):
+    x0, y0 = points[i]
+    for j in range(i + 1, len(points)):
+      x1, y1 = points[j]
+      dx = x1 - x0
+      if dx <= 0:
+        continue
+      slopes.append((y1 - y0) / float(dx))
+  if not slopes:
+    return None
+  slopes.sort()
+  n = len(slopes)
+  mid = n // 2
+  if n % 2 == 1:
+    return float(slopes[mid])
+  return float(0.5 * (slopes[mid - 1] + slopes[mid]))
+
+
+def _forecast_terminal_crit_lr(
+  current_ema_crit_lr: Optional[float],
+  crit_points: Sequence[Tuple[int, float]],
+  *,
+  step: int,
+  warmup_steps: int,
+) -> Optional[float]:
+  if current_ema_crit_lr is None or (not math.isfinite(current_ema_crit_lr)) or current_ema_crit_lr <= 0.0:
+    return None
+  log_slope = _theil_sen_log_slope(crit_points)
+  if log_slope is None or not math.isfinite(log_slope):
+    return float(current_ema_crit_lr)
+  steps_remaining = max(0, int(max(1, warmup_steps) - int(step + 1)))
+  forecast_log = math.log(max(float(current_ema_crit_lr), 1e-12)) + (float(log_slope) * float(steps_remaining))
+  forecast_log = min(700.0, max(math.log(1e-12), forecast_log))
+  return float(math.exp(forecast_log))
+
+
+def _cap_early_warmup_lr_increase(
+  current_lr: float,
+  proposed_lr: float,
+  *,
+  step: int,
+  warmup_steps: int,
+  early_fraction: float = 0.10,
+  max_increase_fraction: float = 0.10,
+) -> float:
+  if (not math.isfinite(current_lr)) or current_lr <= 0.0:
+    return proposed_lr
+  if (not math.isfinite(proposed_lr)) or proposed_lr <= 0.0:
+    return proposed_lr
+  if proposed_lr <= current_lr:
+    return proposed_lr
+  early_steps = max(1, int(math.ceil(float(max(1, warmup_steps)) * float(early_fraction))))
+  if (step + 1) > early_steps:
+    return proposed_lr
+  capped_lr = current_lr * (1.0 + float(max_increase_fraction))
+  return min(proposed_lr, capped_lr)
+
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+  msg = str(exc).lower()
+  return "out of memory" in msg or "cuda error: out of memory" in msg
+
+
+def _cuda_free_memory_fraction(device: torch.device) -> Optional[float]:
+  if device.type != "cuda":
+    return None
+  try:
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device=device)
+  except Exception:
+    return None
+  if total_bytes <= 0:
+    return None
+  return float(free_bytes) / float(total_bytes)
+
+
+def _batch_total_loss(
+  batch: torch.Tensor,
+  *,
+  preprocess_audio,
+  teacher: nn.Module,
+  student: nn.Module,
+  proj: nn.Module,
+  device: torch.device,
+  contrastive_temp: float,
+  loss_mse_weight: float,
+  loss_contrastive_weight: float,
+  loss_relational_weight: float,
+  autocast_ctx,
+  teacher_autocast_ctx,
+) -> float:
+  batch = batch.to(device, non_blocking=True)
+  with torch.inference_mode():
+    spec = preprocess_audio(batch)
+    target = _teacher_targets_from_spec(
+      teacher,
+      spec,
+      teacher_autocast_ctx=teacher_autocast_ctx,
+    )
+    with autocast_ctx():
+      student_feats = _student_features(student, spec)
+      student_emb = proj(student_feats)
+      loss_total, _loss_mse, _loss_con, _loss_rel = _weighted_distill_loss(
+        student_emb,
+        target,
+        temperature=contrastive_temp,
+        loss_mse_weight=loss_mse_weight,
+        loss_contrastive_weight=loss_contrastive_weight,
+        loss_relational_weight=loss_relational_weight,
+      )
+  return float(loss_total.detach().cpu())
+
+
+def _adamw_step_directions(optim: torch.optim.Optimizer) -> List[Tuple[torch.nn.Parameter, torch.Tensor]]:
+  out: List[Tuple[torch.nn.Parameter, torch.Tensor]] = []
+  with torch.no_grad():
+    for group in optim.param_groups:
+      beta1, beta2 = group["betas"]
+      eps = float(group["eps"])
+      weight_decay = float(group.get("weight_decay", 0.0))
+      amsgrad = bool(group.get("amsgrad", False))
+      for p in group["params"]:
+        grad = p.grad
+        if grad is None:
+          continue
+        if grad.is_sparse:
+          continue
+        state = optim.state.get(p, {})
+        exp_avg = state.get("exp_avg")
+        exp_avg_sq = state.get("exp_avg_sq")
+        if exp_avg is None:
+          exp_avg_cur = grad.detach().clone().mul_(1.0 - beta1)
+        else:
+          exp_avg_cur = exp_avg.detach().clone().mul_(beta1).add_(grad.detach(), alpha=(1.0 - beta1))
+        if exp_avg_sq is None:
+          exp_avg_sq_cur = grad.detach().clone().pow_(2).mul_(1.0 - beta2)
+        else:
+          exp_avg_sq_cur = exp_avg_sq.detach().clone().mul_(beta2).addcmul_(
+            grad.detach(),
+            grad.detach(),
+            value=(1.0 - beta2),
+          )
+        if amsgrad:
+          max_exp_avg_sq = state.get("max_exp_avg_sq")
+          if max_exp_avg_sq is not None:
+            exp_avg_sq_cur = torch.maximum(max_exp_avg_sq.detach(), exp_avg_sq_cur)
+        step_t = state.get("step", 0)
+        if torch.is_tensor(step_t):
+          step_idx = int(step_t.item())
+        else:
+          step_idx = int(step_t)
+        step_next = step_idx + 1
+        bias_correction1 = 1.0 - (beta1 ** step_next)
+        bias_correction2 = 1.0 - (beta2 ** step_next)
+        if bias_correction1 <= 0.0 or bias_correction2 <= 0.0:
+          continue
+        denom = exp_avg_sq_cur.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
+        direction = exp_avg_cur.div_(bias_correction1).div_(denom)
+        if weight_decay != 0.0:
+          direction = direction.add(p.detach(), alpha=weight_decay)
+        out.append((p, direction))
+  return out
+
+
+def _estimate_critical_lr(
+  *,
+  loader: DataLoader,
+  data_iter: Iterator[torch.Tensor],
+  preprocess_audio,
+  teacher: nn.Module,
+  student: nn.Module,
+  proj: nn.Module,
+  optim: torch.optim.Optimizer,
+  device: torch.device,
+  contrastive_temp: float,
+  loss_mse_weight: float,
+  loss_contrastive_weight: float,
+  loss_relational_weight: float,
+  autocast_ctx,
+  teacher_autocast_ctx,
+  current_lr: float,
+  prev_estimate: Optional[float],
+  max_lr_cap: Optional[float],
+) -> Tuple[Optional[float], Iterator[torch.Tensor]]:
+  directions = _adamw_step_directions(optim)
+  if not directions:
+    return None, data_iter
+  batch, data_iter = _next_batch(loader, data_iter)
+  student_was_training = student.training
+  proj_was_training = proj.training
+  student.eval()
+  proj.eval()
+  applied_lr = 0.0
+  try:
+    base_loss = _batch_total_loss(
+      batch,
+      preprocess_audio=preprocess_audio,
+      teacher=teacher,
+      student=student,
+      proj=proj,
+      device=device,
+      contrastive_temp=contrastive_temp,
+      loss_mse_weight=loss_mse_weight,
+      loss_contrastive_weight=loss_contrastive_weight,
+      loss_relational_weight=loss_relational_weight,
+      autocast_ctx=autocast_ctx,
+      teacher_autocast_ctx=teacher_autocast_ctx,
+    )
+    if not math.isfinite(base_loss):
+      return None, data_iter
+    loss_limit = base_loss * 1.0001
+
+    def _set_virtual_lr(target_lr: float) -> None:
+      nonlocal applied_lr
+      delta = float(target_lr) - float(applied_lr)
+      if abs(delta) <= 0.0:
+        return
+      with torch.no_grad():
+        for p, direction in directions:
+          p.add_(direction, alpha=-delta)
+      applied_lr = float(target_lr)
+
+    def _eval_at(lr_value: float) -> float:
+      _set_virtual_lr(lr_value)
+      return _batch_total_loss(
+        batch,
+        preprocess_audio=preprocess_audio,
+        teacher=teacher,
+        student=student,
+        proj=proj,
+        device=device,
+        contrastive_temp=contrastive_temp,
+        loss_mse_weight=loss_mse_weight,
+        loss_contrastive_weight=loss_contrastive_weight,
+        loss_relational_weight=loss_relational_weight,
+        autocast_ctx=autocast_ctx,
+        teacher_autocast_ctx=teacher_autocast_ctx,
+      )
+
+    low = 0.0
+    high: Optional[float] = None
+    probe = max(float(current_lr), 1e-8)
+    if prev_estimate is not None and math.isfinite(prev_estimate) and prev_estimate > 0:
+      probe = max(probe, float(prev_estimate))
+    max_probe = max(probe, 1e-8) * (2.0 ** 12)
+    if max_lr_cap is not None and max_lr_cap > 0:
+      max_probe = max(max_probe, float(max_lr_cap) * 2.0)
+    for _ in range(12):
+      probe = min(probe, max_probe)
+      loss_probe = _eval_at(probe)
+      if (not math.isfinite(loss_probe)) or loss_probe > loss_limit:
+        high = probe
+        break
+      low = probe
+      if probe >= max_probe:
+        break
+      probe = min(max_probe, probe * 2.0)
+    if high is None:
+      return (low if low > 0.0 else probe), data_iter
+    for _ in range(10):
+      mid = 0.5 * (low + high)
+      loss_mid = _eval_at(mid)
+      if math.isfinite(loss_mid) and loss_mid <= loss_limit:
+        low = mid
+      else:
+        high = mid
+    return (low if low > 0.0 else None), data_iter
+  finally:
+    if applied_lr != 0.0:
+      with torch.no_grad():
+        for p, direction in directions:
+          p.add_(direction, alpha=applied_lr)
+    if student_was_training:
+      student.train()
+    if proj_was_training:
+      proj.train()
 
 
 def _next_batch(
@@ -1035,6 +1920,7 @@ def _estimate_gns(
   loss_contrastive_weight: float,
   loss_relational_weight: float,
   autocast_ctx,
+  teacher_autocast_ctx,
 ) -> Tuple[Optional[Dict[str, float]], Iterator[torch.Tensor]]:
   grads: List[torch.Tensor] = []
   losses: List[float] = []
@@ -1045,22 +1931,34 @@ def _estimate_gns(
   for _ in range(2):
     batch, data_iter = _next_batch(loader, data_iter)
     batch = batch.to(device, non_blocking=True)
-    with torch.no_grad():
-      spec = preprocess_audio(batch)
-      target = teacher(spec, return_dict=True).pooler_output.detach()
+    spec = preprocess_audio(batch)
+    target = _teacher_targets_from_spec(
+      teacher,
+      spec,
+      teacher_autocast_ctx=teacher_autocast_ctx,
+    )
     student.zero_grad(set_to_none=True)
     proj.zero_grad(set_to_none=True)
     with autocast_ctx():
       student_feats = _student_features(student, spec)
       student_emb = proj(student_feats)
-      loss_mse = F.mse_loss(student_emb, target)
-      loss_con = _contrastive_loss(student_emb, target, temperature=contrastive_temp)
-      loss_rel = _relational_loss(student_emb, target)
-      loss_total = (
-        loss_mse_weight * loss_mse
-        + loss_contrastive_weight * loss_con
-        + loss_relational_weight * loss_rel
+      loss_total, loss_mse, loss_con, loss_rel = _weighted_distill_loss(
+        student_emb,
+        target,
+        temperature=contrastive_temp,
+        loss_mse_weight=loss_mse_weight,
+        loss_contrastive_weight=loss_contrastive_weight,
+        loss_relational_weight=loss_relational_weight,
       )
+    loss_value = float(loss_total.detach().cpu())
+    if not math.isfinite(loss_value):
+      student.zero_grad(set_to_none=True)
+      proj.zero_grad(set_to_none=True)
+      if not student_was_training:
+        student.eval()
+      if not proj_was_training:
+        proj.eval()
+      return None, data_iter
     loss_total.backward()
     g = _sample_grad_vector(trainable_params, gns_param_sample)
     if g.numel() == 0:
@@ -1071,8 +1969,16 @@ def _estimate_gns(
       if not proj_was_training:
         proj.eval()
       return None, data_iter
+    if not torch.isfinite(g).all():
+      student.zero_grad(set_to_none=True)
+      proj.zero_grad(set_to_none=True)
+      if not student_was_training:
+        student.eval()
+      if not proj_was_training:
+        proj.eval()
+      return None, data_iter
     grads.append(g)
-    losses.append(float(loss_total.detach().cpu()))
+    losses.append(loss_value)
 
   student.zero_grad(set_to_none=True)
   proj.zero_grad(set_to_none=True)
@@ -1090,7 +1996,11 @@ def _estimate_gns(
   mean = 0.5 * (g1 + g2)
   noise_batch = 0.5 * float(torch.dot(diff, diff))
   signal = float(torch.dot(mean, mean))
+  if (not math.isfinite(noise_batch)) or (not math.isfinite(signal)):
+    return None, data_iter
   nsr = noise_batch / max(signal, 1e-12)
+  if not math.isfinite(nsr):
+    return None, data_iter
   optimal_batch = float(batch_size) * nsr if signal > 0.0 else float("nan")
   return {
     "gns_opt_batch": optimal_batch,
@@ -1172,10 +2082,44 @@ def main() -> None:
     _die("--val-every must be > 0.")
   if args.val_batches <= 0:
     _die("--val-batches must be > 0.")
+  if args.val_shard_refresh_sec <= 0:
+    _die("--val-shard-refresh-sec must be > 0.")
   if args.lr_warmup_steps < 0:
     _die("--lr-warmup-steps must be >= 0.")
   if not (0.0 <= args.lr_min_ratio <= 1.0):
     _die("--lr-min-ratio must be in [0, 1].")
+  if args.auto_warmup_init_lr < 0:
+    _die("--auto-warmup-init-lr must be >= 0.")
+  if args.auto_warmup_probe_batch_size < 0:
+    _die("--auto-warmup-probe-batch-size must be >= 0.")
+  if args.auto_warmup_steps <= 0:
+    _die("--auto-warmup-steps must be > 0.")
+  if args.auto_warmup_metric_every <= 0:
+    _die("--auto-warmup-metric-every must be > 0.")
+  if args.auto_warmup_lr_safety_frac <= 0:
+    _die("--auto-warmup-lr-safety-frac must be > 0.")
+  if not (0.0 <= args.auto_warmup_ema_beta < 1.0):
+    _die("--auto-warmup-ema-beta must be in [0, 1).")
+  if not (0.0 <= args.auto_warmup_cbs_ema_beta < 1.0):
+    _die("--auto-warmup-cbs-ema-beta must be in [0, 1).")
+  if args.gns_batch_window <= 0:
+    _die("--gns-batch-window must be > 0.")
+  if not (0.0 < args.gns_batch_target_utility < 1.0):
+    _die("--gns-batch-target-utility must be in (0, 1).")
+  if args.batch_opt_mult < 1.0:
+    _die("--batch-opt-mult must be >= 1.0.")
+  if not (0.0 <= args.batch_opt_oom_buffer_frac < 1.0):
+    _die("--batch-opt-oom-buffer-frac must be in [0, 1).")
+  if args.auto_warmup_lr_outlier_factor < 1.0:
+    _die("--auto-warmup-lr-outlier-factor must be >= 1.0.")
+  if args.auto_warmup_cbs_outlier_factor < 1.0:
+    _die("--auto-warmup-cbs-outlier-factor must be >= 1.0.")
+  if args.auto_warmup_batch_round_to <= 0:
+    _die("--auto-warmup-batch-round-to must be > 0.")
+  if args.auto_warmup_max_lr < 0:
+    _die("--auto-warmup-max-lr must be >= 0.")
+  if args.auto_warmup_max_batch_size < 0:
+    _die("--auto-warmup-max-batch-size must be >= 0.")
   if not (0.0 <= args.lr_gns_ema_beta < 1.0):
     _die("--lr-gns-ema-beta must be in [0, 1).")
   if args.lr_gns_min_samples <= 0:
@@ -1190,23 +2134,39 @@ def main() -> None:
     _die("--lr-gns-min-factor must be <= --lr-gns-max-factor.")
   if args.lr_gns_ref_batch < 0:
     _die("--lr-gns-ref-batch must be >= 0.")
+  if args.optimizer_log_every <= 0:
+    _die("--optimizer-log-every must be > 0.")
+  if args.teacher_batch_factor <= 0:
+    _die("--teacher-batch-factor must be > 0.")
+  if args.teacher_max_batch < 0:
+    _die("--teacher-max-batch must be >= 0.")
+  if args.optimizer_mode != "teacher-superbatch" and args.teacher_batch_factor != 1:
+    _die("--teacher-batch-factor > 1 requires --optimizer-mode teacher-superbatch.")
   if args.max_checkpoints < 0:
     _die("--max-checkpoints must be >= 0.")
   if args.gns_every < 0:
     _die("--gns-every must be >= 0.")
   if args.gns_param_sample <= 0:
     _die("--gns-param-sample must be > 0.")
-  if args.lr_gns_adapt and args.gns_every <= 0:
-    _die("--lr-gns-adapt requires --gns-every > 0.")
+  lr_gns_mode = "sqrt" if args.lr_gns_adapt else str(args.lr_gns_mode)
+  if lr_gns_mode == "sqrt" and args.gns_every <= 0:
+    _die("--lr-gns-mode sqrt requires --gns-every > 0.")
   if args.resume_from is not None and args.resume_latest:
     _die("Use only one of --resume-from or --resume-latest.")
+  if args.lr_schedule_start_step < 0:
+    _die("--lr-schedule-start-step must be >= 0.")
+  if args.auto_warmup and args.lr_warmup_steps > 0:
+    _die("--auto-warmup cannot be combined with --lr-warmup-steps.")
+  if args.auto_warmup and args.auto_warmup_steps >= args.max_steps:
+    _die("--auto-warmup-steps must be < --max-steps so the run has a post-warmup phase.")
 
   data_dir = args.data_dir
   shards = _discover_shards(data_dir, args.shards_glob, args.streams_glob)
   if not shards:
     _die(f"No shards found in {data_dir} matching {args.shards_glob}")
-  val_enabled = bool(args.val_fraction > 0.0 or args.val_target_clips > 0)
-  if len(shards) < 2 and val_enabled:
+  orchestrated_val_manifest = args.val_manifest.resolve() if args.val_manifest is not None else None
+  val_enabled = bool(args.val_fraction > 0.0 or args.val_target_clips > 0 or orchestrated_val_manifest is not None)
+  if len(shards) < 2 and val_enabled and orchestrated_val_manifest is None:
     if args.live_shard_refresh:
       print(
         "Warning: fewer than 2 shards at startup with --live-shard-refresh; validation setup will be deferred.",
@@ -1288,9 +2248,6 @@ def main() -> None:
     f"param_bytes={_format_bytes(student_param_bytes)}",
     flush=True,
   )
-  print("=== Teacher Model ===", flush=True)
-  print(teacher, flush=True)
-  print("=== Student Model ===", flush=True)
   if use_canon:
     canon_b_mode = "qkv" if getattr(args, "canon_b_qkv", False) else "post-attn"
     pos_enc_mode = "off" if getattr(args, "canon_no_pos_enc", False) else "on"
@@ -1300,13 +2257,19 @@ def main() -> None:
       f"pos_enc={pos_enc_mode})",
       flush=True,
     )
-  print(student, flush=True)
-  print("=== Student Projection ===", flush=True)
-  print(proj, flush=True)
 
   # Optimizer
   params = list(student.parameters()) + list(proj.parameters())
-  optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+  fused_adamw_active = False
+  if args.fused_adamw and device.type == "cuda":
+    try:
+      optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, fused=True)
+      fused_adamw_active = True
+    except Exception as exc:
+      print(f"Warning: fused AdamW unavailable ({exc}); falling back to eager AdamW.", flush=True)
+      optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+  else:
+    optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
   if args.amp and device.type == "cuda":
     try:
       scaler = torch.amp.GradScaler("cuda")
@@ -1320,6 +2283,65 @@ def main() -> None:
     scaler = _NoopScaler()
     def _autocast():
       return contextlib.nullcontext()
+  _teacher_autocast = _autocast
+
+  optimizer_mode = str(args.optimizer_mode)
+  perf_enabled = optimizer_mode in {"diagnostic", "teacher-superbatch"}
+  teacher_superbatch_enabled = optimizer_mode == "teacher-superbatch"
+  teacher_superbatch_runtime_factor = int(args.teacher_batch_factor if teacher_superbatch_enabled else 1)
+  perf_window = _PerfWindow() if perf_enabled else None
+  compile_available = hasattr(torch, "compile")
+  student_loss_module = _StudentLossWrapper(
+    student=student,
+    proj=proj,
+    temperature=args.contrastive_temp,
+    loss_mse_weight=args.loss_mse_weight,
+    loss_contrastive_weight=args.loss_contrastive_weight,
+    loss_relational_weight=args.loss_relational_weight,
+  )
+  student_loss_runner: nn.Module = student_loss_module
+  teacher_compiled_active = False
+  student_compiled_active = False
+
+  def _compile_kwargs() -> Dict[str, object]:
+    return {
+      "mode": args.compile_mode,
+      "dynamic": bool(args.compile_dynamic),
+    }
+
+  def _enable_teacher_compile() -> None:
+    nonlocal teacher, teacher_compiled_active
+    if teacher_compiled_active or not args.compile_teacher:
+      return
+    if not compile_available:
+      print("Warning: torch.compile unavailable; leaving teacher eager.", flush=True)
+      return
+    try:
+      teacher = torch.compile(teacher, **_compile_kwargs())
+      teacher_compiled_active = True
+      print(
+        f"compile teacher=1 mode={args.compile_mode} dynamic={int(bool(args.compile_dynamic))}",
+        flush=True,
+      )
+    except Exception as exc:
+      print(f"Warning: failed to compile teacher ({exc}); leaving teacher eager.", flush=True)
+
+  def _enable_student_compile(reason: str) -> None:
+    nonlocal student_loss_runner, student_compiled_active
+    if student_compiled_active or not args.compile_student:
+      return
+    if not compile_available:
+      print("Warning: torch.compile unavailable; leaving student loss path eager.", flush=True)
+      return
+    try:
+      student_loss_runner = torch.compile(student_loss_module, **_compile_kwargs())
+      student_compiled_active = True
+      print(
+        f"compile student=1 reason={reason} mode={args.compile_mode} dynamic={int(bool(args.compile_dynamic))}",
+        flush=True,
+      )
+    except Exception as exc:
+      print(f"Warning: failed to compile student loss path ({exc}); leaving eager.", flush=True)
 
   resume_ckpt_path: Optional[Path] = None
   if args.resume_from is not None:
@@ -1329,12 +2351,56 @@ def main() -> None:
     if resume_ckpt_path is None:
       _die(f"--resume-latest requested, but no checkpoint found in {args.out}.")
 
-  lr_gns_ref_batch = float(args.lr_gns_ref_batch) if args.lr_gns_ref_batch > 0 else float(args.batch_size * max(1, args.grad_accum))
+  auto_warmup_enabled = bool(args.auto_warmup)
+  auto_warmup_init_lr = float(args.auto_warmup_init_lr) if args.auto_warmup_init_lr > 0 else max(float(args.lr) * 0.01, 1e-8)
+  auto_warmup_probe_batch_size = int(args.auto_warmup_probe_batch_size) if args.auto_warmup_probe_batch_size > 0 else max(8, int(args.batch_size) // 4)
+  auto_warmup_probe_batch_size = max(1, auto_warmup_probe_batch_size)
+  auto_warmup_max_lr = float(args.auto_warmup_max_lr) if args.auto_warmup_max_lr > 0 else None
+  auto_warmup_max_batch_size = int(args.auto_warmup_max_batch_size) if args.auto_warmup_max_batch_size > 0 else None
+  auto_warmup_lr_freeze_step = max(1, int(args.auto_warmup_steps) // 2) if auto_warmup_enabled else 0
+  if auto_warmup_max_batch_size is not None:
+    auto_warmup_probe_batch_size = min(auto_warmup_probe_batch_size, auto_warmup_max_batch_size)
+  current_train_batch = int(args.batch_size)
+  auto_warmup_current_lr = float(args.lr)
+  auto_warmup_handoff_lr: Optional[float] = None
+  auto_warmup_handoff_batch_size: Optional[int] = None
+  auto_warmup_ema_crit_lr: Optional[float] = None
+  auto_warmup_first_crit_lr: Optional[float] = None
+  auto_warmup_recent_crit_points: List[Tuple[int, float]] = []
+  auto_warmup_last_crit_update_step: Optional[int] = None
+  auto_warmup_last_crit_lr: Optional[float] = None
+  auto_warmup_last_crit_sharpness: Optional[float] = None
+  auto_warmup_last_lr_goal: Optional[float] = None
+  auto_warmup_last_batch_goal: Optional[float] = None
+  auto_warmup_gpu_batch_cap: Optional[int] = auto_warmup_max_batch_size
+  auto_warmup_last_safe_batch_size = int(args.batch_size)
+  auto_warmup_restored = False
+  if auto_warmup_enabled:
+    current_train_batch = auto_warmup_probe_batch_size
+    auto_warmup_current_lr = auto_warmup_init_lr
+    auto_warmup_last_safe_batch_size = int(current_train_batch)
+
+  lr_gns_manual_ref_batch = bool(args.lr_gns_ref_batch > 0)
   lr_gns_ema_opt_batch: Optional[float] = None
+  lr_gns_selected_opt_batch: Optional[float] = None
+  lr_gns_recent_opt_batches: List[float] = []
+  batch_opt_runtime_mult = max(1.0, float(args.batch_opt_mult))
+  last_batch_opt_step_speedup: Optional[float] = None
+  last_effective_opt_batch: Optional[float] = None
   lr_gns_samples = 0
   lr_gns_factor = 1.0
   lr_gns_last_update_step = 0
   step = 0
+
+  def _resolve_lr_gns_ref_batch(batch_size: int) -> float:
+    if lr_gns_manual_ref_batch:
+      return float(args.lr_gns_ref_batch)
+    if auto_warmup_enabled and step >= args.auto_warmup_steps:
+      ref_batch_size = auto_warmup_handoff_batch_size if auto_warmup_handoff_batch_size is not None else batch_size
+      return float(ref_batch_size * max(1, args.grad_accum))
+    return float(batch_size * max(1, args.grad_accum))
+
+  lr_gns_ref_batch = _resolve_lr_gns_ref_batch(current_train_batch)
 
   if resume_ckpt_path is not None:
     ckpt = _load_training_checkpoint(Path(resume_ckpt_path))
@@ -1363,6 +2429,44 @@ def main() -> None:
           lr_gns_ema_opt_batch = float(raw_ema)
         except Exception:
           lr_gns_ema_opt_batch = None
+      raw_selected = gns_state.get("selected_opt_batch")
+      if raw_selected is not None:
+        try:
+          lr_gns_selected_opt_batch = float(raw_selected)
+        except Exception:
+          lr_gns_selected_opt_batch = None
+      raw_batch_opt_mult = gns_state.get("batch_opt_runtime_mult")
+      if raw_batch_opt_mult is not None:
+        try:
+          batch_opt_runtime_mult = max(1.0, float(raw_batch_opt_mult))
+        except Exception:
+          batch_opt_runtime_mult = batch_opt_runtime_mult
+      raw_recent_opt_batches = gns_state.get("recent_opt_batches")
+      if isinstance(raw_recent_opt_batches, list):
+        lr_gns_recent_opt_batches = _sanitize_positive_float_window(
+          raw_recent_opt_batches,
+          max_len=int(args.gns_batch_window),
+        )
+      if (
+        (lr_gns_selected_opt_batch is None or not math.isfinite(lr_gns_selected_opt_batch) or lr_gns_selected_opt_batch <= 0.0)
+        and lr_gns_recent_opt_batches
+      ):
+        lr_gns_selected_opt_batch = _select_cbs_from_recent_window(
+          lr_gns_recent_opt_batches,
+          target_utility=float(args.gns_batch_target_utility),
+        )
+      raw_last_effective = gns_state.get("last_effective_opt_batch")
+      if raw_last_effective is not None:
+        try:
+          last_effective_opt_batch = float(raw_last_effective)
+        except Exception:
+          last_effective_opt_batch = None
+      raw_last_step_speedup = gns_state.get("last_batch_opt_step_speedup")
+      if raw_last_step_speedup is not None:
+        try:
+          last_batch_opt_step_speedup = float(raw_last_step_speedup)
+        except Exception:
+          last_batch_opt_step_speedup = None
       try:
         lr_gns_samples = int(gns_state.get("samples", 0))
       except Exception:
@@ -1375,7 +2479,120 @@ def main() -> None:
         lr_gns_last_update_step = int(gns_state.get("last_update_step", step))
       except Exception:
         lr_gns_last_update_step = step
+    optimizer_mode_state = ckpt.get("optimizer_mode_state")
+    if teacher_superbatch_enabled and isinstance(optimizer_mode_state, dict):
+      raw_runtime_factor = optimizer_mode_state.get("teacher_superbatch_runtime_factor")
+      if raw_runtime_factor is not None:
+        try:
+          saved_runtime_factor = max(1, int(raw_runtime_factor))
+          teacher_superbatch_runtime_factor = min(int(args.teacher_batch_factor), saved_runtime_factor)
+        except Exception:
+          teacher_superbatch_runtime_factor = teacher_superbatch_runtime_factor
+    auto_warmup_state = ckpt.get("auto_warmup_state")
+    if auto_warmup_enabled and isinstance(auto_warmup_state, dict):
+      auto_warmup_restored = True
+      try:
+        current_train_batch = int(auto_warmup_state.get("current_batch_size", current_train_batch))
+      except Exception:
+        current_train_batch = current_train_batch
+      try:
+        auto_warmup_current_lr = float(auto_warmup_state.get("current_lr", auto_warmup_current_lr))
+      except Exception:
+        auto_warmup_current_lr = auto_warmup_current_lr
+      raw_ema_crit_lr = auto_warmup_state.get("ema_crit_lr")
+      if raw_ema_crit_lr is not None:
+        try:
+          auto_warmup_ema_crit_lr = float(raw_ema_crit_lr)
+        except Exception:
+          auto_warmup_ema_crit_lr = None
+      raw_first_crit_lr = auto_warmup_state.get("first_crit_lr")
+      if raw_first_crit_lr is not None:
+        try:
+          auto_warmup_first_crit_lr = float(raw_first_crit_lr)
+        except Exception:
+          auto_warmup_first_crit_lr = None
+      raw_recent_crit_points = auto_warmup_state.get("recent_crit_points")
+      if isinstance(raw_recent_crit_points, list):
+        restored_points: List[Tuple[int, float]] = []
+        for item in raw_recent_crit_points[-7:]:
+          if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+          try:
+            restored_step = int(item[0])
+            restored_value = float(item[1])
+          except Exception:
+            continue
+          if (not math.isfinite(restored_value)) or restored_value <= 0.0:
+            continue
+          restored_points.append((restored_step, restored_value))
+        auto_warmup_recent_crit_points = restored_points
+      raw_last_crit_update_step = auto_warmup_state.get("last_crit_update_step")
+      if raw_last_crit_update_step is not None:
+        try:
+          auto_warmup_last_crit_update_step = int(raw_last_crit_update_step)
+        except Exception:
+          auto_warmup_last_crit_update_step = None
+      raw_last_crit_lr = auto_warmup_state.get("last_crit_lr")
+      if raw_last_crit_lr is not None:
+        try:
+          auto_warmup_last_crit_lr = float(raw_last_crit_lr)
+        except Exception:
+          auto_warmup_last_crit_lr = None
+      raw_last_crit_sharpness = auto_warmup_state.get("last_crit_sharpness")
+      if raw_last_crit_sharpness is not None:
+        try:
+          auto_warmup_last_crit_sharpness = float(raw_last_crit_sharpness)
+        except Exception:
+          auto_warmup_last_crit_sharpness = None
+      raw_last_lr_goal = auto_warmup_state.get("last_lr_goal")
+      if raw_last_lr_goal is not None:
+        try:
+          auto_warmup_last_lr_goal = float(raw_last_lr_goal)
+        except Exception:
+          auto_warmup_last_lr_goal = None
+      raw_last_batch_goal = auto_warmup_state.get("last_batch_goal")
+      if raw_last_batch_goal is not None:
+        try:
+          auto_warmup_last_batch_goal = float(raw_last_batch_goal)
+        except Exception:
+          auto_warmup_last_batch_goal = None
+      raw_handoff_lr = auto_warmup_state.get("handoff_lr")
+      if raw_handoff_lr is not None:
+        try:
+          auto_warmup_handoff_lr = float(raw_handoff_lr)
+        except Exception:
+          auto_warmup_handoff_lr = None
+      raw_handoff_batch = auto_warmup_state.get("handoff_batch_size")
+      if raw_handoff_batch is not None:
+        try:
+          auto_warmup_handoff_batch_size = int(raw_handoff_batch)
+        except Exception:
+          auto_warmup_handoff_batch_size = None
+      raw_gpu_cap = auto_warmup_state.get("gpu_batch_cap")
+      if raw_gpu_cap is not None:
+        try:
+          auto_warmup_gpu_batch_cap = int(raw_gpu_cap)
+        except Exception:
+          auto_warmup_gpu_batch_cap = auto_warmup_gpu_batch_cap
+      try:
+        auto_warmup_last_safe_batch_size = int(auto_warmup_state.get("last_safe_batch_size", auto_warmup_last_safe_batch_size))
+      except Exception:
+        auto_warmup_last_safe_batch_size = auto_warmup_last_safe_batch_size
+      if step >= auto_warmup_lr_freeze_step and auto_warmup_last_lr_goal is None:
+        auto_warmup_last_lr_goal = float(auto_warmup_current_lr)
+    elif auto_warmup_enabled:
+      if step > 0:
+        _die(
+          "Checkpoint has no auto warmup state; cannot safely resume with --auto-warmup. "
+          "Resume from a checkpoint produced by the auto-warmup trainer or restart from step 0."
+        )
+      print("Warning: checkpoint has no auto warmup state; warmup controller will start from fresh defaults.", flush=True)
+    lr_gns_ref_batch = _resolve_lr_gns_ref_batch(current_train_batch)
     print(f"Resumed training from {Path(resume_ckpt_path)} at step={step}.", flush=True)
+
+  _enable_teacher_compile()
+  if (not auto_warmup_enabled) or step >= args.auto_warmup_steps:
+    _enable_student_compile("startup")
 
   # Data
   rng = random.Random(args.seed)
@@ -1385,7 +2602,9 @@ def main() -> None:
   val_shards: List[Path] = []
   val_clip_total = 0
   deferred_val_setup = False
-  if val_enabled:
+  if orchestrated_val_manifest is not None:
+    print(f"Validation manifest: {orchestrated_val_manifest}", flush=True)
+  elif val_enabled:
     candidate_val_shards, candidate_val_clips = _select_val_shards(
       shard_list,
       seed=args.seed,
@@ -1407,7 +2626,7 @@ def main() -> None:
       val_shards = candidate_val_shards
       val_clip_total = candidate_val_clips
   train_shards = [s for s in shard_list if s not in set(val_shards)]
-  if val_enabled and not deferred_val_setup and not train_shards:
+  if val_enabled and orchestrated_val_manifest is None and not deferred_val_setup and not train_shards:
     if args.live_shard_refresh:
       deferred_val_setup = True
       val_shards = []
@@ -1418,7 +2637,11 @@ def main() -> None:
       _die("Validation split left no training shards.")
   print(
     f"Train shards: {len(train_shards)} | Val shards: {len(val_shards)}"
-    + (f" (val_clips~{val_clip_total})" if val_shards else (" (deferred)" if deferred_val_setup else "")),
+    + (
+      f" (manifest={orchestrated_val_manifest})"
+      if orchestrated_val_manifest is not None
+      else (f" (val_clips~{val_clip_total})" if val_shards else (" (deferred)" if deferred_val_setup else ""))
+    ),
     flush=True,
   )
   val_shards_file = args.val_shards_file if args.val_shards_file is not None else (args.out / "val_shards.json")
@@ -1435,7 +2658,7 @@ def main() -> None:
     print(f"Warning: failed to write val shard file {val_shards_file}: {exc}", flush=True)
 
   clip_samples = int(round(args.clip_seconds * args.sample_rate))
-  def _build_train_loader(excluded_shards: List[Path]) -> Tuple[ClipDataset, DataLoader]:
+  def _build_train_loader(excluded_shards: List[Path], batch_size: int) -> Tuple[ClipDataset, DataLoader]:
     train_source = shard_list if args.live_shard_refresh else [s for s in shard_list if s not in set(excluded_shards)]
     ds = ClipDataset(
       train_source,
@@ -1450,17 +2673,16 @@ def main() -> None:
       refresh_interval_sec=args.shard_refresh_sec,
       exclude_shards=excluded_shards,
     )
-    ld = DataLoader(
+    ld = _make_data_loader(
       ds,
-      batch_size=args.batch_size,
+      batch_size=batch_size,
       num_workers=args.num_workers,
       pin_memory=(device.type == "cuda"),
       drop_last=True,
-      prefetch_factor=2,
     )
     return ds, ld
 
-  def _build_val_loader(selected_val_shards: List[Path]) -> Tuple[ClipDataset, DataLoader]:
+  def _build_val_loader(selected_val_shards: List[Path], batch_size: int) -> Tuple[ClipDataset, DataLoader]:
     ds = ClipDataset(
       selected_val_shards,
       clip_samples=clip_samples,
@@ -1474,32 +2696,92 @@ def main() -> None:
       refresh_interval_sec=args.shard_refresh_sec,
       exclude_shards=None,
     )
-    ld = DataLoader(
+    ld = _make_data_loader(
       ds,
-      batch_size=args.batch_size,
+      batch_size=batch_size,
       num_workers=max(1, args.num_workers // 2),
       pin_memory=(device.type == "cuda"),
       drop_last=True,
-      prefetch_factor=2,
     )
     return ds, ld
 
-  dataset, loader = _build_train_loader(val_shards)
+  def _build_val_manifest_loader(manifest_path: Path, batch_size: int) -> Tuple[ManifestClipDataset, DataLoader]:
+    ds = ManifestClipDataset(
+      manifest_path,
+      clip_samples=clip_samples,
+      sample_rate=args.sample_rate,
+      shuffle_shards=True,
+      seed=args.seed + 999,
+      repeat=True,
+      refresh_interval_sec=(args.val_shard_refresh_sec if args.val_live_refresh else 10**9),
+    )
+    ld = _make_data_loader(
+      ds,
+      batch_size=batch_size,
+      num_workers=max(1, args.num_workers // 2),
+      pin_memory=(device.type == "cuda"),
+      drop_last=True,
+    )
+    return ds, ld
+
+  dataset, loader = _build_train_loader(val_shards, current_train_batch)
   val_dataset = None
   val_loader = None
-  if val_shards:
-    val_dataset, val_loader = _build_val_loader(val_shards)
+  if orchestrated_val_manifest is not None:
+    val_dataset, val_loader = _build_val_manifest_loader(orchestrated_val_manifest, current_train_batch)
+  elif val_shards:
+    val_dataset, val_loader = _build_val_loader(val_shards, current_train_batch)
 
   # Training
   out_dir = args.out
   out_dir.mkdir(parents=True, exist_ok=True)
   t0 = time.perf_counter()
   if args.lr_gns_adapt:
+    print("Warning: --lr-gns-adapt is deprecated; use --lr-gns-mode sqrt.", flush=True)
+  if auto_warmup_enabled and lr_gns_mode == "sqrt":
+    print("Auto warmup enabled: LR GNS sqrt adaptation will stay disabled until warmup ends.", flush=True)
+  if auto_warmup_enabled:
     print(
-      "LR GNS adapt enabled: "
+      "Auto warmup enabled: "
+      f"init_lr={auto_warmup_current_lr:.3e} probe_batch={current_train_batch} "
+      f"steps={args.auto_warmup_steps} metric_every={args.auto_warmup_metric_every} "
+      f"lr_freeze_step={auto_warmup_lr_freeze_step} "
+      f"lr_safety={args.auto_warmup_lr_safety_frac:.3f} "
+      f"lr_ema_beta={args.auto_warmup_ema_beta:.3f} cbs_ema_beta={args.auto_warmup_cbs_ema_beta:.3f} "
+      f"cbs_window={args.gns_batch_window} cbs_target_utility={args.gns_batch_target_utility:.3f} "
+      f"batch_opt_mult={batch_opt_runtime_mult:.3f} oom_buffer={args.batch_opt_oom_buffer_frac:.3f}"
+      + (f" max_lr={auto_warmup_max_lr:.3e}" if auto_warmup_max_lr is not None else "")
+      + (f" max_batch={auto_warmup_max_batch_size}" if auto_warmup_max_batch_size is not None else ""),
+      flush=True,
+    )
+  if lr_gns_mode == "sqrt":
+    print(
+      "LR GNS mode=sqrt: "
       f"ref_batch={lr_gns_ref_batch:.1f} beta={args.lr_gns_ema_beta} "
       f"min_samples={args.lr_gns_min_samples} update_every={args.lr_gns_update_every} "
-      f"factor_range=[{args.lr_gns_min_factor}, {args.lr_gns_max_factor}]",
+      f"factor_range=[{args.lr_gns_min_factor}, {args.lr_gns_max_factor}] "
+      f"cbs_window={args.gns_batch_window} cbs_target_utility={args.gns_batch_target_utility:.3f} "
+      f"batch_opt_mult={batch_opt_runtime_mult:.3f} oom_buffer={args.batch_opt_oom_buffer_frac:.3f}",
+      flush=True,
+    )
+  elif args.gns_every > 0:
+    print("LR GNS mode=stable: GNS will be measured and logged, but LR stays on the base schedule.", flush=True)
+  student_compile_status = "on" if student_compiled_active else (
+    "deferred" if args.compile_student and auto_warmup_enabled and step < args.auto_warmup_steps else "off"
+  )
+  print(
+    "Runtime backend: "
+    f"fused_adamw={int(fused_adamw_active)} "
+    f"compile_teacher={'on' if teacher_compiled_active else 'off'} "
+    f"compile_student={student_compile_status}",
+    flush=True,
+  )
+  if perf_enabled:
+    print(
+      "Optimizer mode: "
+      f"{optimizer_mode} log_every={args.optimizer_log_every} "
+      f"teacher_batch_factor={teacher_superbatch_runtime_factor}"
+      + (f" teacher_max_batch={args.teacher_max_batch}" if args.teacher_max_batch > 0 else ""),
       flush=True,
     )
   if args.wandb:
@@ -1525,12 +2807,42 @@ def main() -> None:
       "scaler": scaler.state_dict() if scaler.is_enabled() else None,
       "step": step,
       "lr_gns_state": {
+        "mode": lr_gns_mode,
         "ema_opt_batch": lr_gns_ema_opt_batch,
+        "selected_opt_batch": lr_gns_selected_opt_batch,
+        "batch_opt_runtime_mult": float(batch_opt_runtime_mult),
+        "recent_opt_batches": [float(v) for v in lr_gns_recent_opt_batches[-int(args.gns_batch_window) :]],
+        "last_effective_opt_batch": last_effective_opt_batch,
+        "last_batch_opt_step_speedup": last_batch_opt_step_speedup,
         "samples": int(lr_gns_samples),
         "factor": float(lr_gns_factor),
         "last_update_step": int(lr_gns_last_update_step),
         "ref_batch": float(lr_gns_ref_batch),
       },
+      "optimizer_mode_state": {
+        "mode": optimizer_mode,
+        "teacher_superbatch_runtime_factor": int(teacher_superbatch_runtime_factor),
+      },
+      "auto_warmup_state": (
+        {
+          "current_lr": float(auto_warmup_current_lr),
+          "current_batch_size": int(current_train_batch),
+          "ema_crit_lr": auto_warmup_ema_crit_lr,
+          "first_crit_lr": auto_warmup_first_crit_lr,
+          "recent_crit_points": [[int(s), float(v)] for s, v in auto_warmup_recent_crit_points[-7:]],
+          "last_crit_update_step": auto_warmup_last_crit_update_step,
+          "last_crit_lr": auto_warmup_last_crit_lr,
+          "last_crit_sharpness": auto_warmup_last_crit_sharpness,
+          "last_lr_goal": auto_warmup_last_lr_goal,
+          "last_batch_goal": auto_warmup_last_batch_goal,
+          "handoff_lr": auto_warmup_handoff_lr,
+          "handoff_batch_size": auto_warmup_handoff_batch_size,
+          "gpu_batch_cap": auto_warmup_gpu_batch_cap,
+          "last_safe_batch_size": int(auto_warmup_last_safe_batch_size),
+        }
+        if auto_warmup_enabled
+        else None
+      ),
       "args": vars(args),
     }
     torch.save(ckpt, out_dir / f"ckpt_{tag}.pt")
@@ -1541,10 +2853,237 @@ def main() -> None:
 
   data_iter = iter(loader)
   val_iter = iter(val_loader) if val_loader is not None else None
+  teacher_cache: Deque[Tuple[torch.Tensor, torch.Tensor]] = deque()
+  def _refresh_runtime_loaders(reason: str) -> None:
+    nonlocal dataset, loader, data_iter, val_dataset, val_loader, val_iter, lr_gns_ref_batch, teacher_cache
+    dataset, loader = _build_train_loader(val_shards, current_train_batch)
+    data_iter = iter(loader)
+    teacher_cache.clear()
+    if val_shards:
+      val_dataset, val_loader = _build_val_loader(val_shards, current_train_batch)
+      val_iter = iter(val_loader)
+    elif orchestrated_val_manifest is not None:
+      val_dataset, val_loader = _build_val_manifest_loader(orchestrated_val_manifest, current_train_batch)
+      val_iter = iter(val_loader)
+    else:
+      val_dataset = None
+      val_loader = None
+      val_iter = None
+    lr_gns_ref_batch = _resolve_lr_gns_ref_batch(current_train_batch)
+    print(f"runtime_batch_update step={step} batch={current_train_batch} reason={reason}", flush=True)
+
+  def _teacher_superbatch_group_count() -> int:
+    if not teacher_superbatch_enabled:
+      return 1
+    factor = max(1, int(teacher_superbatch_runtime_factor))
+    if args.teacher_max_batch > 0:
+      factor = min(factor, max(1, int(args.teacher_max_batch) // max(1, current_train_batch)))
+    return max(1, factor)
+
+  def _update_batch_opt_diagnostics() -> None:
+    nonlocal last_batch_opt_step_speedup, last_effective_opt_batch
+    if lr_gns_selected_opt_batch is None or (not math.isfinite(lr_gns_selected_opt_batch)) or lr_gns_selected_opt_batch <= 0.0:
+      last_effective_opt_batch = None
+      last_batch_opt_step_speedup = None
+      return
+    last_effective_opt_batch = float(lr_gns_selected_opt_batch) * max(1.0, float(batch_opt_runtime_mult))
+    last_batch_opt_step_speedup = _expected_step_speedup_from_batches(
+      crit_batches=lr_gns_recent_opt_batches,
+      baseline_batch=float(lr_gns_selected_opt_batch),
+      candidate_batch=float(last_effective_opt_batch),
+    )
+
+  def _current_batch_goal_from_selected() -> Optional[int]:
+    batch_goal, effective_cbs = _resolve_batch_goal_from_cbs(
+      lr_gns_selected_opt_batch,
+      batch_opt_mult=batch_opt_runtime_mult,
+      round_to=args.auto_warmup_batch_round_to,
+      gpu_batch_cap=auto_warmup_gpu_batch_cap,
+      max_batch_size=auto_warmup_max_batch_size,
+    )
+    if effective_cbs is not None:
+      _update_batch_opt_diagnostics()
+    return batch_goal
+
+  def _backoff_batch_opt_multiplier(reason: str, *, failed_batch: Optional[int]) -> bool:
+    nonlocal batch_opt_runtime_mult, current_train_batch, auto_warmup_gpu_batch_cap, auto_warmup_last_batch_goal
+    if lr_gns_selected_opt_batch is None or (not math.isfinite(lr_gns_selected_opt_batch)) or lr_gns_selected_opt_batch <= 0.0:
+      return False
+    if batch_opt_runtime_mult <= 1.0 and (failed_batch is None or current_train_batch <= 1):
+      return False
+    buffer_frac = float(args.batch_opt_oom_buffer_frac)
+    reference_batch = int(failed_batch) if failed_batch is not None else int(current_train_batch)
+    if auto_warmup_active and current_train_batch > auto_warmup_last_safe_batch_size:
+      reference_batch = min(reference_batch, int(auto_warmup_last_safe_batch_size))
+    target_batch = max(1.0, float(reference_batch) * max(0.0, 1.0 - buffer_frac))
+    new_mult = max(1.0, target_batch / max(float(lr_gns_selected_opt_batch), 1e-8))
+    changed = bool(new_mult < (batch_opt_runtime_mult - 1e-6))
+    batch_opt_runtime_mult = min(batch_opt_runtime_mult, new_mult)
+    _update_batch_opt_diagnostics()
+    batch_goal = _current_batch_goal_from_selected()
+    if batch_goal is not None:
+      auto_warmup_last_batch_goal = float(batch_goal)
+      if batch_goal < current_train_batch:
+        current_train_batch = int(batch_goal)
+        if auto_warmup_gpu_batch_cap is None:
+          auto_warmup_gpu_batch_cap = int(current_train_batch)
+        else:
+          auto_warmup_gpu_batch_cap = min(int(auto_warmup_gpu_batch_cap), int(current_train_batch))
+        _refresh_runtime_loaders(reason)
+        changed = True
+    if changed:
+      print(
+        f"batch_opt backoff step={step} reason={reason} mult={batch_opt_runtime_mult:.3f} "
+        f"batch={current_train_batch}"
+        + (
+          f" cbs_sel~={lr_gns_selected_opt_batch:.1f}"
+          if lr_gns_selected_opt_batch is not None
+          else ""
+        )
+        + (
+          f" step_x~={last_batch_opt_step_speedup:.3f}"
+          if last_batch_opt_step_speedup is not None
+          else ""
+        ),
+        flush=True,
+      )
+    return changed
+
+  def _maybe_backoff_near_oom() -> bool:
+    nonlocal teacher_superbatch_runtime_factor, teacher_cache
+    free_frac = _cuda_free_memory_fraction(device)
+    if free_frac is None or free_frac >= float(args.batch_opt_oom_buffer_frac):
+      return False
+    effective_teacher_group = _teacher_superbatch_group_count()
+    if teacher_superbatch_enabled and effective_teacher_group > 1:
+      failed_factor = int(teacher_superbatch_runtime_factor)
+      teacher_superbatch_runtime_factor = max(1, failed_factor // 2)
+      teacher_cache.clear()
+      if device.type == "cuda":
+        torch.cuda.empty_cache()
+      print(
+        f"teacher_superbatch near_oom_backoff step={step} free_frac={free_frac:.3f} "
+        f"failed_factor={failed_factor} new_factor={teacher_superbatch_runtime_factor}",
+        flush=True,
+      )
+      return True
+    return _backoff_batch_opt_multiplier("near_oom_backoff", failed_batch=current_train_batch)
+
+  def _collect_teacher_group(group_count: int, step_timer: _StepTimer) -> Tuple[List[torch.Tensor], List[torch.Tensor], int]:
+    nonlocal data_iter
+    raw_batches: List[torch.Tensor] = []
+    chunk_sizes: List[int] = []
+    wait_start = time.perf_counter()
+    for _ in range(max(1, int(group_count))):
+      batch, data_iter = _next_batch(loader, data_iter)
+      raw_batches.append(batch)
+      chunk_sizes.append(int(batch.shape[0]))
+    step_timer.add_ms("loader_wait_ms", (time.perf_counter() - wait_start) * 1000.0)
+
+    merged_batch = raw_batches[0] if len(raw_batches) == 1 else torch.cat(raw_batches, dim=0)
+    step_timer.start("h2d_ms")
+    merged_batch = merged_batch.to(device, non_blocking=True)
+    step_timer.stop("h2d_ms")
+    step_timer.start("preprocess_ms")
+    spec_all = preprocess_audio(merged_batch)
+    step_timer.stop("preprocess_ms")
+    step_timer.start("teacher_ms")
+    target_all = _teacher_targets_from_spec(
+      teacher,
+      spec_all,
+      teacher_autocast_ctx=_teacher_autocast,
+    )
+    step_timer.stop("teacher_ms")
+    return list(spec_all.split(chunk_sizes, dim=0)), list(target_all.split(chunk_sizes, dim=0)), len(chunk_sizes)
+
+  def _fill_teacher_cache(step_timer: _StepTimer) -> None:
+    nonlocal teacher_cache
+    if teacher_cache:
+      return
+    group_count = _teacher_superbatch_group_count()
+    spec_chunks, target_chunks, _actual_group_count = _collect_teacher_group(group_count, step_timer)
+    teacher_cache.extend(zip(spec_chunks, target_chunks))
+
+  auto_warmup_active = bool(auto_warmup_enabled and step < args.auto_warmup_steps)
+  if auto_warmup_enabled and not auto_warmup_active:
+    if auto_warmup_handoff_lr is None:
+      auto_warmup_handoff_lr = float(auto_warmup_current_lr)
+    if auto_warmup_handoff_batch_size is None:
+      auto_warmup_handoff_batch_size = int(current_train_batch)
+  if auto_warmup_active and (not auto_warmup_restored or lr_gns_selected_opt_batch is None):
+    bootstrap_metrics, data_iter = _estimate_gns(
+      loader=loader,
+      data_iter=data_iter,
+      preprocess_audio=preprocess_audio,
+      teacher=teacher,
+      student=student,
+      proj=proj,
+      device=device,
+      trainable_params=params,
+      batch_size=current_train_batch,
+      gns_param_sample=args.gns_param_sample,
+      contrastive_temp=args.contrastive_temp,
+      loss_mse_weight=args.loss_mse_weight,
+      loss_contrastive_weight=args.loss_contrastive_weight,
+      loss_relational_weight=args.loss_relational_weight,
+      autocast_ctx=_autocast,
+      teacher_autocast_ctx=_teacher_autocast,
+    )
+    if bootstrap_metrics is not None:
+      bootstrap_opt_batch = float(bootstrap_metrics.get("gns_opt_batch", float("nan")))
+      if math.isfinite(bootstrap_opt_batch) and bootstrap_opt_batch > 0:
+        lr_gns_recent_opt_batches = _sanitize_positive_float_window(
+          list(lr_gns_recent_opt_batches) + [bootstrap_opt_batch],
+          max_len=int(args.gns_batch_window),
+        )
+        lr_gns_ema_opt_batch = bootstrap_opt_batch
+        lr_gns_selected_opt_batch = _select_cbs_from_recent_window(
+          lr_gns_recent_opt_batches,
+          target_utility=float(args.gns_batch_target_utility),
+        )
+        lr_gns_samples = max(1, lr_gns_samples)
+        _update_batch_opt_diagnostics()
+        bootstrap_batch = _current_batch_goal_from_selected()
+        if bootstrap_batch is None:
+          bootstrap_batch = _round_batch_size_down(bootstrap_opt_batch, args.auto_warmup_batch_round_to)
+          if auto_warmup_gpu_batch_cap is not None:
+            bootstrap_batch = min(bootstrap_batch, auto_warmup_gpu_batch_cap)
+          if auto_warmup_max_batch_size is not None:
+            bootstrap_batch = min(bootstrap_batch, auto_warmup_max_batch_size)
+        # Warmup batch bootstrap is growth-only; do not shrink below the probe
+        # batch unless an explicit OOM path forces us down later.
+        bootstrap_batch = max(int(current_train_batch), int(max(1, bootstrap_batch)))
+        auto_warmup_last_batch_goal = float(bootstrap_batch)
+        current_train_batch = int(bootstrap_batch)
+        if current_train_batch != loader.batch_size:
+          _refresh_runtime_loaders("auto_warmup_bootstrap")
+        print(
+          f"auto_warmup bootstrap_batch={current_train_batch} cbs~={bootstrap_opt_batch:.1f} "
+          + (
+            f" cbs_sel~={lr_gns_selected_opt_batch:.1f}"
+            if lr_gns_selected_opt_batch is not None
+            else ""
+          )
+          + (
+            f" cbs_eff~={last_effective_opt_batch:.1f}"
+            if last_effective_opt_batch is not None
+            else ""
+          )
+          + (
+            f" step_x~={last_batch_opt_step_speedup:.3f}"
+            if last_batch_opt_step_speedup is not None
+            else ""
+          )
+          + " "
+          f"nsr={bootstrap_metrics['gns_nsr']:.4f}",
+          flush=True,
+        )
+
   while step < args.max_steps:
     if (
       deferred_val_setup
       and val_enabled
+      and orchestrated_val_manifest is None
       and args.live_shard_refresh
       and step >= args.val_defer_start_steps
       and (step % args.val_defer_check_every == 0)
@@ -1565,9 +3104,9 @@ def main() -> None:
         if target_ready:
           val_shards = candidate_val_shards
           val_clip_total = candidate_val_clips
-          dataset, loader = _build_train_loader(val_shards)
+          dataset, loader = _build_train_loader(val_shards, current_train_batch)
           data_iter = iter(loader)
-          val_dataset, val_loader = _build_val_loader(val_shards)
+          val_dataset, val_loader = _build_val_loader(val_shards, current_train_batch)
           val_iter = iter(val_loader)
           deferred_val_setup = False
           try:
@@ -1589,91 +3128,271 @@ def main() -> None:
             flush=True,
           )
 
-    base_lr = args.lr * _lr_multiplier(
-      step=step + 1,
-      max_steps=args.max_steps,
-      schedule=args.lr_schedule,
-      warmup_steps=args.lr_warmup_steps,
-      min_ratio=args.lr_min_ratio,
-    )
-    cur_lr = base_lr * (lr_gns_factor if args.lr_gns_adapt else 1.0)
+    auto_warmup_active = bool(auto_warmup_enabled and step < args.auto_warmup_steps)
+    lr_gns_controller_active = bool(lr_gns_mode == "sqrt" and not auto_warmup_active)
+    if auto_warmup_active:
+      base_lr = float(auto_warmup_current_lr)
+    elif auto_warmup_enabled:
+      if auto_warmup_handoff_lr is None:
+        auto_warmup_handoff_lr = float(auto_warmup_current_lr)
+      if auto_warmup_handoff_batch_size is None:
+        auto_warmup_handoff_batch_size = int(current_train_batch)
+      lr_gns_ref_batch = _resolve_lr_gns_ref_batch(current_train_batch)
+      schedule_step = max(0, step - args.auto_warmup_steps)
+      schedule_max_steps = max(1, args.max_steps - args.auto_warmup_steps)
+      base_lr = float(auto_warmup_handoff_lr) * _lr_multiplier(
+        step=schedule_step,
+        max_steps=schedule_max_steps,
+        schedule=args.lr_schedule,
+        warmup_steps=0,
+        min_ratio=args.lr_min_ratio,
+      )
+    else:
+      lr_gns_ref_batch = _resolve_lr_gns_ref_batch(current_train_batch)
+      schedule_start_step = max(0, int(args.lr_schedule_start_step))
+      schedule_step = max(0, (step + 1) - schedule_start_step)
+      schedule_max_steps = max(1, args.max_steps - schedule_start_step)
+      base_lr = args.lr * _lr_multiplier(
+        step=schedule_step,
+        max_steps=schedule_max_steps,
+        schedule=args.lr_schedule,
+        warmup_steps=args.lr_warmup_steps,
+        min_ratio=args.lr_min_ratio,
+      )
+    cur_lr = base_lr * (lr_gns_factor if lr_gns_controller_active else 1.0)
     _set_lr(optim, cur_lr)
     optim.zero_grad(set_to_none=True)
-    total_loss = 0.0
-    mse_sum = 0.0
-    con_sum = 0.0
-    rel_sum = 0.0
-    cos_sum = 0.0
-    tnorm_sum = 0.0
-    snorm_sum = 0.0
-    mse0_sum = 0.0
-    ev_sum = 0.0
+    total_loss_t = torch.zeros((), device=device, dtype=torch.float32)
+    mse_sum_t = torch.zeros((), device=device, dtype=torch.float32)
+    con_sum_t = torch.zeros((), device=device, dtype=torch.float32)
+    rel_sum_t = torch.zeros((), device=device, dtype=torch.float32)
+    cos_sum_t = torch.zeros((), device=device, dtype=torch.float32)
+    tnorm_sum_t = torch.zeros((), device=device, dtype=torch.float32)
+    snorm_sum_t = torch.zeros((), device=device, dtype=torch.float32)
+    mse0_sum_t = torch.zeros((), device=device, dtype=torch.float32)
+    ev_sum_t = torch.zeros((), device=device, dtype=torch.float32)
+    warmup_metric_step = bool(auto_warmup_active and ((step + 1) % args.auto_warmup_metric_every == 0))
+    step_wall_start = time.perf_counter()
+    step_timer = _StepTimer(device=device, enabled=perf_enabled)
+    try:
+      accum_done = 0
+      while accum_done < args.grad_accum:
+        _fill_teacher_cache(step_timer)
+        spec, target = teacher_cache.popleft()
+        step_timer.start("student_fwd_ms")
+        with _autocast():
+          loss_total, loss_mse, loss_con, loss_rel, student_emb = student_loss_runner(
+            spec,
+            target,
+          )
+          loss = loss_total / args.grad_accum
+        if not torch.isfinite(loss_total.detach()):
+          raise RuntimeError(
+            "Non-finite training loss "
+            f"at step={step} lr={cur_lr:.3e} batch={current_train_batch} "
+            f"(mse={float(loss_mse.detach().float().cpu()):.6f} "
+            f"con={float(loss_con.detach().float().cpu()):.6f} "
+            f"rel={float(loss_rel.detach().float().cpu()):.6f})"
+          )
 
-    for _ in range(args.grad_accum):
-      batch, data_iter = _next_batch(loader, data_iter)
+        with torch.no_grad():
+          t_f = target.float()
+          s_f = student_emb.float()
+          tnorm = t_f.norm(dim=-1).mean()
+          snorm = s_f.norm(dim=-1).mean()
+          cos = F.cosine_similarity(s_f, t_f, dim=-1).mean()
+          mse0 = (t_f * t_f).mean()
+          var = t_f.var(unbiased=False)
+          ev = 1.0 - (loss_mse.float() / (var + 1e-8))
+        step_timer.stop("student_fwd_ms")
 
-      batch = batch.to(device, non_blocking=True)
-      with torch.no_grad():
-        spec = preprocess_audio(batch)
-        teacher_out = teacher(spec, return_dict=True)
-        target = teacher_out.pooler_output.detach()
+        step_timer.start("backward_ms")
+        scaler.scale(loss).backward()
+        step_timer.stop("backward_ms")
+        total_loss_t = total_loss_t + loss.detach().float()
+        mse_sum_t = mse_sum_t + loss_mse.detach().float()
+        con_sum_t = con_sum_t + loss_con.detach().float()
+        rel_sum_t = rel_sum_t + loss_rel.detach().float()
+        cos_sum_t = cos_sum_t + cos.detach().float()
+        tnorm_sum_t = tnorm_sum_t + tnorm.detach().float()
+        snorm_sum_t = snorm_sum_t + snorm.detach().float()
+        mse0_sum_t = mse0_sum_t + mse0.detach().float()
+        ev_sum_t = ev_sum_t + ev.detach().float()
+        accum_done += 1
 
-      with _autocast():
-        student_feats = _student_features(student, spec)
-        student_emb = proj(student_feats)
-        loss_mse = torch.nn.functional.mse_loss(student_emb, target)
-        loss_con = _contrastive_loss(student_emb, target, temperature=args.contrastive_temp)
-        loss_rel = _relational_loss(student_emb, target)
-        loss = (
-          args.loss_mse_weight * loss_mse
-          + args.loss_contrastive_weight * loss_con
-          + args.loss_relational_weight * loss_rel
-        ) / args.grad_accum
+      if warmup_metric_step:
+        aux_start = time.perf_counter()
+        current_safe_lr: Optional[float] = None
+        if step < auto_warmup_lr_freeze_step:
+          if scaler.is_enabled():
+            scaler.unscale_(optim)
+          crit_lr_est, data_iter = _estimate_critical_lr(
+            loader=loader,
+            data_iter=data_iter,
+            preprocess_audio=preprocess_audio,
+            teacher=teacher,
+            student=student,
+            proj=proj,
+            optim=optim,
+            device=device,
+            contrastive_temp=args.contrastive_temp,
+            loss_mse_weight=args.loss_mse_weight,
+            loss_contrastive_weight=args.loss_contrastive_weight,
+            loss_relational_weight=args.loss_relational_weight,
+            autocast_ctx=_autocast,
+            teacher_autocast_ctx=_teacher_autocast,
+            current_lr=cur_lr,
+            prev_estimate=(auto_warmup_ema_crit_lr if auto_warmup_ema_crit_lr is not None else auto_warmup_last_crit_lr),
+            max_lr_cap=auto_warmup_max_lr,
+          )
+          if crit_lr_est is not None and math.isfinite(crit_lr_est) and crit_lr_est > 0:
+            beta = float(args.auto_warmup_ema_beta)
+            filtered_crit_lr = float(crit_lr_est)
+            if auto_warmup_first_crit_lr is None:
+              auto_warmup_first_crit_lr = float(filtered_crit_lr)
+            auto_warmup_last_crit_lr = float(filtered_crit_lr)
+            auto_warmup_last_crit_sharpness = 1.0 / max(float(filtered_crit_lr), 1e-12)
+            current_safe_lr = float(args.auto_warmup_lr_safety_frac) * max(float(filtered_crit_lr), 0.0)
+            if auto_warmup_ema_crit_lr is None:
+              auto_warmup_ema_crit_lr = float(filtered_crit_lr)
+            else:
+              auto_warmup_ema_crit_lr = (beta * auto_warmup_ema_crit_lr) + ((1.0 - beta) * float(filtered_crit_lr))
+            auto_warmup_recent_crit_points.append((int(step), float(filtered_crit_lr)))
+            if len(auto_warmup_recent_crit_points) > 7:
+              auto_warmup_recent_crit_points = auto_warmup_recent_crit_points[-7:]
+            auto_warmup_last_crit_update_step = int(step)
+            forecast_crit_lr = _forecast_terminal_crit_lr(
+              auto_warmup_ema_crit_lr,
+              auto_warmup_recent_crit_points,
+              step=step,
+              warmup_steps=args.auto_warmup_steps,
+            )
+            if (
+              forecast_crit_lr is not None
+              and auto_warmup_first_crit_lr is not None
+              and math.isfinite(auto_warmup_first_crit_lr)
+              and auto_warmup_first_crit_lr > 0.0
+            ):
+              forecast_crit_lr = min(float(forecast_crit_lr), float(auto_warmup_first_crit_lr))
+            forecast_safe_lr = float(args.auto_warmup_lr_safety_frac) * max(
+              float(forecast_crit_lr if forecast_crit_lr is not None else auto_warmup_ema_crit_lr),
+              0.0,
+            )
+            final_target_update = (step + max(1, int(args.auto_warmup_metric_every))) >= auto_warmup_lr_freeze_step
+            if final_target_update and current_safe_lr is not None and math.isfinite(current_safe_lr) and current_safe_lr > 0.0:
+              lr_goal = float(current_safe_lr)
+            else:
+              lr_goal = forecast_safe_lr
+            if current_safe_lr is not None and math.isfinite(current_safe_lr) and current_safe_lr > 0.0:
+              lr_goal = min(lr_goal, float(current_safe_lr))
+            if auto_warmup_max_lr is not None:
+              lr_goal = min(lr_goal, auto_warmup_max_lr)
+            auto_warmup_last_lr_goal = lr_goal
+        lr_goal = auto_warmup_last_lr_goal
+        if lr_goal is not None and math.isfinite(lr_goal) and lr_goal > 0.0:
+          next_lr = _ramp_warmup_lr(
+            float(auto_warmup_current_lr),
+            float(lr_goal),
+            step=step,
+            warmup_steps=args.auto_warmup_steps,
+            metric_every=args.auto_warmup_metric_every,
+          )
+          next_lr = _cap_early_warmup_lr_increase(
+            float(auto_warmup_current_lr),
+            float(next_lr),
+            step=step,
+            warmup_steps=args.auto_warmup_steps,
+          )
+          if current_safe_lr is not None and math.isfinite(current_safe_lr) and current_safe_lr > 0.0:
+            next_lr = min(next_lr, float(current_safe_lr))
+          auto_warmup_current_lr = float(next_lr)
+          cur_lr = float(next_lr)
+          _set_lr(optim, cur_lr)
+        step_timer.add_ms("aux_ms", (time.perf_counter() - aux_start) * 1000.0)
 
-      with torch.no_grad():
-        t_f = target.float()
-        s_f = student_emb.float()
-        tnorm = t_f.norm(dim=-1).mean()
-        snorm = s_f.norm(dim=-1).mean()
-        cos = F.cosine_similarity(s_f, t_f, dim=-1).mean()
-        mse0 = (t_f * t_f).mean()
-        var = t_f.var(unbiased=False)
-        ev = 1.0 - (loss_mse.float() / (var + 1e-8))
-
-      scaler.scale(loss).backward()
-      total_loss += float(loss.detach().cpu())
-      mse_sum += float(loss_mse.detach().cpu())
-      con_sum += float(loss_con.detach().cpu())
-      rel_sum += float(loss_rel.detach().cpu())
-      cos_sum += float(cos.detach().cpu())
-      tnorm_sum += float(tnorm.detach().cpu())
-      snorm_sum += float(snorm.detach().cpu())
-      mse0_sum += float(mse0.detach().cpu())
-      ev_sum += float(ev.detach().cpu())
-
-    scaler.step(optim)
-    scaler.update()
+      step_timer.start("optim_ms")
+      scaler.step(optim)
+      scaler.update()
+      step_timer.stop("optim_ms")
+    except RuntimeError as exc:
+      effective_teacher_group = _teacher_superbatch_group_count()
+      if teacher_superbatch_enabled and _is_cuda_oom(exc) and effective_teacher_group > 1:
+        failed_factor = int(teacher_superbatch_runtime_factor)
+        teacher_superbatch_runtime_factor = max(1, failed_factor // 2)
+        teacher_cache.clear()
+        optim.zero_grad(set_to_none=True)
+        student.zero_grad(set_to_none=True)
+        proj.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+          torch.cuda.empty_cache()
+        print(
+          f"teacher_superbatch oom_backoff step={step} failed_factor={failed_factor} "
+          f"new_factor={teacher_superbatch_runtime_factor}",
+          flush=True,
+        )
+        continue
+      if _is_cuda_oom(exc) and _backoff_batch_opt_multiplier("oom_backoff", failed_batch=int(current_train_batch)):
+        optim.zero_grad(set_to_none=True)
+        student.zero_grad(set_to_none=True)
+        proj.zero_grad(set_to_none=True)
+        if device.type == "cuda":
+          torch.cuda.empty_cache()
+        continue
+      raise
+    step_perf = step_timer.finish()
+    if perf_enabled and perf_window is not None:
+      step_perf["step_ms"] = (time.perf_counter() - step_wall_start) * 1000.0
+      perf_window.add(step_perf)
+    _maybe_backoff_near_oom()
     step += 1
+    auto_warmup_last_safe_batch_size = int(current_train_batch)
+
+    if auto_warmup_enabled and step == auto_warmup_lr_freeze_step and auto_warmup_last_lr_goal is not None:
+      print(
+        f"auto_warmup lr_target_frozen step={step} goal_lr={auto_warmup_last_lr_goal:.3e}",
+        flush=True,
+      )
 
     if args.log_every and step % args.log_every == 0:
       elapsed = max(1e-9, time.perf_counter() - t0)
       rate = step / elapsed
       scale = 1.0 / max(1, args.grad_accum)
-      mse_avg = mse_sum * scale
-      con_avg = con_sum * scale
-      rel_avg = rel_sum * scale
-      cos_avg = cos_sum * scale
-      tnorm_avg = tnorm_sum * scale
-      snorm_avg = snorm_sum * scale
-      mse0_avg = mse0_sum * scale
-      ev_avg = ev_sum * scale
+      total_loss = _scalar_to_float(total_loss_t)
+      mse_avg = _scalar_to_float(mse_sum_t) * scale
+      con_avg = _scalar_to_float(con_sum_t) * scale
+      rel_avg = _scalar_to_float(rel_sum_t) * scale
+      cos_avg = _scalar_to_float(cos_sum_t) * scale
+      tnorm_avg = _scalar_to_float(tnorm_sum_t) * scale
+      snorm_avg = _scalar_to_float(snorm_sum_t) * scale
+      mse0_avg = _scalar_to_float(mse0_sum_t) * scale
+      ev_avg = _scalar_to_float(ev_sum_t) * scale
       print(
         f"step={step} loss={total_loss:.6f} "
         f"mse={mse_avg:.6f} con={con_avg:.6f} rel={rel_avg:.6f} "
         f"cos={cos_avg:.4f} tnorm={tnorm_avg:.3f} snorm={snorm_avg:.3f} "
         f"mse0={mse0_avg:.6f} ev={ev_avg:.4f} "
-        f"lr={cur_lr:.3e}"
-        + (f" (base={base_lr:.3e} gns_fac={lr_gns_factor:.3f})" if args.lr_gns_adapt else "")
+        f"lr={cur_lr:.3e} batch={current_train_batch}"
+        + (f" (base={base_lr:.3e} gns_fac={lr_gns_factor:.3f})" if lr_gns_controller_active else "")
+        + (
+          f" aw=1 goal_lr={auto_warmup_last_lr_goal:.3e} cbs~={lr_gns_selected_opt_batch:.1f}"
+          + (
+            f" mult={batch_opt_runtime_mult:.3f}"
+            if batch_opt_runtime_mult > 1.0
+            else ""
+          )
+          + (
+            f" step_x~={last_batch_opt_step_speedup:.3f}"
+            if last_batch_opt_step_speedup is not None
+            else ""
+          )
+          if auto_warmup_active and auto_warmup_last_lr_goal is not None and lr_gns_selected_opt_batch is not None
+          else (" aw=1" if auto_warmup_active else "")
+        )
+        + (
+          f" teacher_fac={teacher_superbatch_runtime_factor}"
+          if teacher_superbatch_enabled
+          else ""
+        )
         + f" steps/s={rate:.2f} elapsed={elapsed:.1f}s",
         flush=True,
       )
@@ -1692,13 +3411,101 @@ def main() -> None:
             "train/explained_variance": ev_avg,
             "train/lr": cur_lr,
             "train/lr_base": base_lr,
-            "train/lr_gns_factor": lr_gns_factor if args.lr_gns_adapt else 1.0,
+            "train/lr_gns_factor": lr_gns_factor if lr_gns_controller_active else 1.0,
+            "train/lr_gns_ref_batch": float(lr_gns_ref_batch),
+            "train/lr_gns_mode_sqrt": float(1.0 if lr_gns_mode == "sqrt" else 0.0),
+            "train/lr_gns_active": float(1.0 if lr_gns_controller_active else 0.0),
+            "train/gns_ema_opt_batch": (lr_gns_ema_opt_batch if lr_gns_ema_opt_batch is not None else float("nan")),
+            "train/gns_selected_opt_batch": (
+              lr_gns_selected_opt_batch if lr_gns_selected_opt_batch is not None else float("nan")
+            ),
+            "train/batch_opt_runtime_mult": float(batch_opt_runtime_mult),
+            "train/batch_opt_step_speedup": (
+              last_batch_opt_step_speedup if last_batch_opt_step_speedup is not None else float("nan")
+            ),
+            "train/effective_opt_batch": (
+              last_effective_opt_batch if last_effective_opt_batch is not None else float("nan")
+            ),
+            "train/batch_size": float(current_train_batch),
+            "train/effective_batch_size": float(current_train_batch * max(1, args.grad_accum)),
+            "train/auto_warmup_active": float(1.0 if auto_warmup_active else 0.0),
+            "train/auto_warmup_lr_goal": (auto_warmup_last_lr_goal if auto_warmup_last_lr_goal is not None else float("nan")),
+            "train/auto_warmup_crit_lr": (auto_warmup_last_crit_lr if auto_warmup_last_crit_lr is not None else float("nan")),
+            "train/auto_warmup_crit_sharpness": (
+              auto_warmup_last_crit_sharpness if auto_warmup_last_crit_sharpness is not None else float("nan")
+            ),
+            "train/auto_warmup_batch": float(current_train_batch),
+            "train/auto_warmup_cbs": (
+              lr_gns_selected_opt_batch if lr_gns_selected_opt_batch is not None else float("nan")
+            ),
+            "train/auto_warmup_cbs_ema": (lr_gns_ema_opt_batch if lr_gns_ema_opt_batch is not None else float("nan")),
+            "train/auto_warmup_handoff_lr": (auto_warmup_handoff_lr if auto_warmup_handoff_lr is not None else float("nan")),
+            "train/auto_warmup_handoff_batch": (
+              float(auto_warmup_handoff_batch_size)
+              if auto_warmup_handoff_batch_size is not None
+              else float("nan")
+            ),
+            "train/optimizer_mode_teacher_superbatch": float(1.0 if teacher_superbatch_enabled else 0.0),
+            "train/teacher_batch_factor": float(teacher_superbatch_runtime_factor),
             "train/steps_per_s": rate,
           },
           step=step,
         )
 
-    if args.gns_every and step % args.gns_every == 0:
+    if perf_enabled and perf_window is not None and step % args.optimizer_log_every == 0:
+      perf_means = perf_window.means()
+      step_ms = float(perf_means.get("step_ms", float("nan")))
+      loader_wait_ms = float(perf_means.get("loader_wait_ms", 0.0))
+      h2d_ms = float(perf_means.get("h2d_ms", 0.0))
+      preprocess_ms = float(perf_means.get("preprocess_ms", 0.0))
+      teacher_ms = float(perf_means.get("teacher_ms", 0.0))
+      student_fwd_ms = float(perf_means.get("student_fwd_ms", 0.0))
+      backward_ms = float(perf_means.get("backward_ms", 0.0))
+      optim_ms = float(perf_means.get("optim_ms", 0.0))
+      aux_ms = float(perf_means.get("aux_ms", 0.0))
+      input_ms = loader_wait_ms + h2d_ms + preprocess_ms
+      student_ms = student_fwd_ms + backward_ms + optim_ms
+      bottleneck = _classify_perf_bottleneck(perf_means)
+      teacher_pct = (teacher_ms / step_ms) if step_ms > 0.0 else float("nan")
+      input_pct = (input_ms / step_ms) if step_ms > 0.0 else float("nan")
+      student_pct = (student_ms / step_ms) if step_ms > 0.0 else float("nan")
+      print(
+        f"perf@step={step} step_ms={step_ms:.2f} "
+        f"loader_wait_ms={loader_wait_ms:.2f} h2d_ms={h2d_ms:.2f} preprocess_ms={preprocess_ms:.2f} "
+        f"teacher_ms={teacher_ms:.2f} student_fwd_ms={student_fwd_ms:.2f} "
+        f"backward_ms={backward_ms:.2f} optim_ms={optim_ms:.2f} aux_ms={aux_ms:.2f} "
+        f"teacher_pct={teacher_pct:.3f} input_pct={input_pct:.3f} student_pct={student_pct:.3f} "
+        f"bottleneck={bottleneck} distributed_comm=na",
+        flush=True,
+      )
+      if wandb is not None:
+        wandb.log(
+          {
+            "perf/step_ms": step_ms,
+            "perf/loader_wait_ms": loader_wait_ms,
+            "perf/h2d_ms": h2d_ms,
+            "perf/preprocess_ms": preprocess_ms,
+            "perf/teacher_ms": teacher_ms,
+            "perf/student_fwd_ms": student_fwd_ms,
+            "perf/backward_ms": backward_ms,
+            "perf/optim_ms": optim_ms,
+            "perf/aux_ms": aux_ms,
+            "perf/input_ms": input_ms,
+            "perf/student_ms": student_ms,
+            "perf/teacher_pct": teacher_pct,
+            "perf/input_pct": input_pct,
+            "perf/student_pct": student_pct,
+            "perf/bottleneck_teacher": float(1.0 if bottleneck == "teacher_bound" else 0.0),
+            "perf/bottleneck_input": float(1.0 if bottleneck == "input_bound" else 0.0),
+            "perf/bottleneck_student": float(1.0 if bottleneck == "student_bound" else 0.0),
+            "perf/distributed_comm_applicable": 0.0,
+            "perf/input_comm_limited": float(1.0 if bottleneck == "input_bound" else 0.0),
+          },
+          step=step,
+        )
+      perf_window.reset()
+
+    if auto_warmup_active and step % args.auto_warmup_metric_every == 0:
       gns_metrics, data_iter = _estimate_gns(
         loader=loader,
         data_iter=data_iter,
@@ -1708,34 +3515,161 @@ def main() -> None:
         proj=proj,
         device=device,
         trainable_params=params,
-        batch_size=args.batch_size,
+        batch_size=current_train_batch,
+        gns_param_sample=args.gns_param_sample,
+        contrastive_temp=args.contrastive_temp,
+        loss_mse_weight=args.loss_mse_weight,
+      loss_contrastive_weight=args.loss_contrastive_weight,
+      loss_relational_weight=args.loss_relational_weight,
+      autocast_ctx=_autocast,
+      teacher_autocast_ctx=_teacher_autocast,
+    )
+      if gns_metrics is not None:
+        gns_opt_batch = float(gns_metrics.get("gns_opt_batch", float("nan")))
+        if math.isfinite(gns_opt_batch) and gns_opt_batch > 0:
+          lr_gns_recent_opt_batches = _sanitize_positive_float_window(
+            list(lr_gns_recent_opt_batches) + [gns_opt_batch],
+            max_len=int(args.gns_batch_window),
+          )
+          if lr_gns_ema_opt_batch is None:
+            lr_gns_ema_opt_batch = gns_opt_batch
+          else:
+            beta = float(args.auto_warmup_cbs_ema_beta)
+            lr_gns_ema_opt_batch = (beta * lr_gns_ema_opt_batch) + ((1.0 - beta) * gns_opt_batch)
+          lr_gns_selected_opt_batch = _select_cbs_from_recent_window(
+            lr_gns_recent_opt_batches,
+            target_utility=float(args.gns_batch_target_utility),
+          )
+          _update_batch_opt_diagnostics()
+          lr_gns_samples += 1
+          if lr_gns_selected_opt_batch is not None and lr_gns_selected_opt_batch > 0:
+            batch_goal = _current_batch_goal_from_selected()
+            if batch_goal is None:
+              batch_goal = _round_batch_size_down(lr_gns_selected_opt_batch, args.auto_warmup_batch_round_to)
+              if auto_warmup_gpu_batch_cap is not None:
+                batch_goal = min(batch_goal, int(auto_warmup_gpu_batch_cap))
+              if auto_warmup_max_batch_size is not None:
+                batch_goal = min(batch_goal, int(auto_warmup_max_batch_size))
+              batch_goal = max(1, batch_goal)
+            auto_warmup_last_batch_goal = float(batch_goal)
+            if batch_goal > current_train_batch:
+              auto_warmup_last_safe_batch_size = int(current_train_batch)
+              current_train_batch = int(batch_goal)
+              _refresh_runtime_loaders("auto_warmup_gns")
+        print(
+          f"auto_warmup@step={step} crit_lr~="
+          f"{(auto_warmup_last_crit_lr if auto_warmup_last_crit_lr is not None else float('nan')):.3e} "
+          f"sharpness~="
+          f"{(auto_warmup_last_crit_sharpness if auto_warmup_last_crit_sharpness is not None else float('nan')):.3e} "
+          f"lr_goal={((auto_warmup_last_lr_goal if auto_warmup_last_lr_goal is not None else float('nan'))):.3e} "
+          f"lr={auto_warmup_current_lr:.3e} "
+          f"cbs~={gns_metrics['gns_opt_batch']:.1f} batch={current_train_batch}"
+          + (
+            f" cbs_sel~={lr_gns_selected_opt_batch:.1f}"
+            if lr_gns_selected_opt_batch is not None
+            else ""
+          )
+          + (
+            f" cbs_eff~={last_effective_opt_batch:.1f}"
+            if last_effective_opt_batch is not None
+            else ""
+          )
+          + (
+            f" cbs_ema~={lr_gns_ema_opt_batch:.1f}"
+            if lr_gns_ema_opt_batch is not None
+            else ""
+          )
+          + (
+            f" step_x~={last_batch_opt_step_speedup:.3f}"
+            if last_batch_opt_step_speedup is not None
+            else ""
+          )
+          + (
+            f" batch_goal={auto_warmup_last_batch_goal:.1f}"
+            if auto_warmup_last_batch_goal is not None
+            else ""
+          )
+          + f" nsr={gns_metrics['gns_nsr']:.4f}",
+          flush=True,
+        )
+        if wandb is not None:
+          wandb.log(
+            {
+              "train/auto_warmup_cbs_raw": gns_metrics["gns_opt_batch"],
+              "train/auto_warmup_cbs": (
+                lr_gns_selected_opt_batch if lr_gns_selected_opt_batch is not None else float("nan")
+              ),
+              "train/auto_warmup_cbs_selected": (
+                lr_gns_selected_opt_batch if lr_gns_selected_opt_batch is not None else float("nan")
+              ),
+              "train/auto_warmup_cbs_effective": (
+                last_effective_opt_batch if last_effective_opt_batch is not None else float("nan")
+              ),
+              "train/auto_warmup_cbs_ema": (lr_gns_ema_opt_batch if lr_gns_ema_opt_batch is not None else float("nan")),
+              "train/auto_warmup_batch_opt_mult": float(batch_opt_runtime_mult),
+              "train/auto_warmup_step_speedup": (
+                last_batch_opt_step_speedup if last_batch_opt_step_speedup is not None else float("nan")
+              ),
+              "train/auto_warmup_batch": float(current_train_batch),
+              "train/auto_warmup_batch_goal": (
+                auto_warmup_last_batch_goal if auto_warmup_last_batch_goal is not None else float("nan")
+              ),
+              "train/auto_warmup_crit_lr": (auto_warmup_last_crit_lr if auto_warmup_last_crit_lr is not None else float("nan")),
+              "train/auto_warmup_crit_sharpness": (
+                auto_warmup_last_crit_sharpness if auto_warmup_last_crit_sharpness is not None else float("nan")
+              ),
+              "train/auto_warmup_nsr": gns_metrics["gns_nsr"],
+            },
+            step=step,
+          )
+    elif args.gns_every and step % args.gns_every == 0:
+      gns_metrics, data_iter = _estimate_gns(
+        loader=loader,
+        data_iter=data_iter,
+        preprocess_audio=preprocess_audio,
+        teacher=teacher,
+        student=student,
+        proj=proj,
+        device=device,
+        trainable_params=params,
+        batch_size=current_train_batch,
         gns_param_sample=args.gns_param_sample,
         contrastive_temp=args.contrastive_temp,
         loss_mse_weight=args.loss_mse_weight,
         loss_contrastive_weight=args.loss_contrastive_weight,
         loss_relational_weight=args.loss_relational_weight,
         autocast_ctx=_autocast,
+        teacher_autocast_ctx=_teacher_autocast,
       )
       if gns_metrics is not None:
         gns_opt_batch = float(gns_metrics.get("gns_opt_batch", float("nan")))
         gns_adapted = False
         gns_raw_factor = float("nan")
         if math.isfinite(gns_opt_batch) and gns_opt_batch > 0:
+          lr_gns_recent_opt_batches = _sanitize_positive_float_window(
+            list(lr_gns_recent_opt_batches) + [gns_opt_batch],
+            max_len=int(args.gns_batch_window),
+          )
           if lr_gns_ema_opt_batch is None:
             lr_gns_ema_opt_batch = gns_opt_batch
           else:
             beta = float(args.lr_gns_ema_beta)
             lr_gns_ema_opt_batch = (beta * lr_gns_ema_opt_batch) + ((1.0 - beta) * gns_opt_batch)
+          lr_gns_selected_opt_batch = _select_cbs_from_recent_window(
+            lr_gns_recent_opt_batches,
+            target_utility=float(args.gns_batch_target_utility),
+          )
+          _update_batch_opt_diagnostics()
           lr_gns_samples += 1
 
           if (
-            args.lr_gns_adapt
+            lr_gns_controller_active
             and lr_gns_samples >= args.lr_gns_min_samples
             and (step - lr_gns_last_update_step) >= args.lr_gns_update_every
-            and lr_gns_ema_opt_batch is not None
-            and lr_gns_ema_opt_batch > 0
+            and lr_gns_selected_opt_batch is not None
+            and lr_gns_selected_opt_batch > 0
           ):
-            gns_raw_factor = lr_gns_ref_batch / max(lr_gns_ema_opt_batch, 1e-8)
+            gns_raw_factor = math.sqrt(lr_gns_ref_batch / max(lr_gns_selected_opt_batch, 1e-8))
             if math.isfinite(gns_raw_factor):
               lr_gns_factor = float(
                 min(
@@ -1751,14 +3685,26 @@ def main() -> None:
           f"nsr={gns_metrics['gns_nsr']:.4f} "
           f"noise={gns_metrics['gns_noise_batch']:.3e} signal={gns_metrics['gns_signal']:.3e}"
           + (
-            f" ema={lr_gns_ema_opt_batch:.1f} samples={lr_gns_samples} "
-            f"lr_fac={lr_gns_factor:.3f}"
+            f" sel={lr_gns_selected_opt_batch:.1f} "
             + (
-              f" raw={gns_raw_factor:.3f} updated={int(gns_adapted)}"
-              if args.lr_gns_adapt and lr_gns_samples >= args.lr_gns_min_samples
+              f"eff={last_effective_opt_batch:.1f} "
+              if last_effective_opt_batch is not None
               else ""
             )
-            if lr_gns_ema_opt_batch is not None
+            + (f"ema={lr_gns_ema_opt_batch:.1f} " if lr_gns_ema_opt_batch is not None else "")
+            + f"samples={lr_gns_samples} mult={batch_opt_runtime_mult:.3f} "
+            f"lr_fac={lr_gns_factor:.3f}"
+            + (
+              f" step_x~={last_batch_opt_step_speedup:.3f}"
+              if last_batch_opt_step_speedup is not None
+              else ""
+            )
+            + (
+              f" raw={gns_raw_factor:.3f} updated={int(gns_adapted)}"
+              if lr_gns_controller_active and lr_gns_samples >= args.lr_gns_min_samples
+              else ""
+            )
+            if lr_gns_selected_opt_batch is not None
             else ""
           ),
           flush=True,
@@ -1772,18 +3718,41 @@ def main() -> None:
               "train/gns_signal": gns_metrics["gns_signal"],
               "train/gns_loss": gns_metrics["gns_loss"],
               "train/gns_ema_opt_batch": (lr_gns_ema_opt_batch if lr_gns_ema_opt_batch is not None else float("nan")),
+              "train/gns_selected_opt_batch": (
+                lr_gns_selected_opt_batch if lr_gns_selected_opt_batch is not None else float("nan")
+              ),
+              "train/gns_effective_opt_batch": (
+                last_effective_opt_batch if last_effective_opt_batch is not None else float("nan")
+              ),
+              "train/batch_opt_runtime_mult": float(batch_opt_runtime_mult),
+              "train/batch_opt_step_speedup": (
+                last_batch_opt_step_speedup if last_batch_opt_step_speedup is not None else float("nan")
+              ),
               "train/gns_samples": float(lr_gns_samples),
-              "train/lr_gns_factor": lr_gns_factor if args.lr_gns_adapt else 1.0,
+              "train/lr_gns_factor": lr_gns_factor if lr_gns_controller_active else 1.0,
+              "train/lr_gns_ref_batch": float(lr_gns_ref_batch),
+              "train/lr_gns_mode_sqrt": float(1.0 if lr_gns_mode == "sqrt" else 0.0),
+              "train/lr_gns_active": float(1.0 if lr_gns_controller_active else 0.0),
               "train/lr_gns_updated": float(1.0 if gns_adapted else 0.0),
             },
             step=step,
           )
 
+    if auto_warmup_enabled and step == args.auto_warmup_steps:
+      auto_warmup_handoff_lr = float(auto_warmup_current_lr)
+      auto_warmup_handoff_batch_size = int(current_train_batch)
+      _enable_student_compile("post_warmup")
+      print(
+        f"auto_warmup handoff step={step} lr={auto_warmup_handoff_lr:.3e} "
+        f"batch={auto_warmup_handoff_batch_size}",
+        flush=True,
+      )
+
     if val_loader is not None and args.val_every and step % args.val_every == 0:
       student.eval()
       proj.eval()
       teacher.eval()
-      with torch.no_grad():
+      with torch.inference_mode():
         v_loss = 0.0
         v_mse = 0.0
         v_con = 0.0
@@ -1804,16 +3773,13 @@ def main() -> None:
             v_batch = next(val_iter)
           v_batch = v_batch.to(device, non_blocking=True)
           v_spec = preprocess_audio(v_batch)
-          v_target = teacher(v_spec, return_dict=True).pooler_output
-          v_student = proj(_student_features(student, v_spec))
-          v_loss_mse = F.mse_loss(v_student, v_target)
-          v_loss_con = _contrastive_loss(v_student, v_target, temperature=args.contrastive_temp)
-          v_loss_rel = _relational_loss(v_student, v_target)
-          v_total = (
-            args.loss_mse_weight * v_loss_mse
-            + args.loss_contrastive_weight * v_loss_con
-            + args.loss_relational_weight * v_loss_rel
+          v_target = _teacher_targets_from_spec(
+            teacher,
+            v_spec,
+            teacher_autocast_ctx=_teacher_autocast,
           )
+          with _autocast():
+            v_total, v_loss_mse, v_loss_con, v_loss_rel, v_student = student_loss_runner(v_spec, v_target)
           t_f = v_target.float()
           s_f = v_student.float()
           v_cos += float(F.cosine_similarity(s_f, t_f, dim=-1).mean().detach().cpu())

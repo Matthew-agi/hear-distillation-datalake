@@ -277,17 +277,22 @@ def _finalize_shard(
         pass
 
 
-def _count_existing_clips(out_dir: Path) -> Tuple[int, int]:
+def _count_existing_shard_stats(out_dir: Path) -> Tuple[int, int, int]:
   if not out_dir.exists():
-    return 0, -1
+    return 0, -1, 0
   shard_paths = sorted(out_dir.glob("shard-*.tar"))
   total = 0
   max_idx = -1
+  total_bytes = 0
   for p in shard_paths:
     try:
       stem = p.stem  # shard-000123
       idx = int(stem.split("-")[-1])
       max_idx = max(max_idx, idx)
+    except Exception:
+      pass
+    try:
+      total_bytes += int(p.stat().st_size)
     except Exception:
       pass
     try:
@@ -297,7 +302,7 @@ def _count_existing_clips(out_dir: Path) -> Tuple[int, int]:
             total += 1
     except Exception:
       continue
-  return total, max_idx
+  return total, max_idx, total_bytes
 
 
 def _resume_state_path(out_dir: Path) -> Path:
@@ -325,7 +330,8 @@ def _save_resume_state(out_dir: Path, payload: Dict[str, Any]) -> None:
 def _parse_args() -> argparse.Namespace:
   ap = argparse.ArgumentParser(description="Stream LAION-Audio-300M and write N random fixed-length clips.")
   ap.add_argument("--out", type=Path, required=True, help="Output directory for shards.")
-  ap.add_argument("--num-clips", type=int, default=500_000, help="Number of 2s clips to write (default: 500000).")
+  ap.add_argument("--num-clips", type=int, default=500_000, help="Number of 2s clips to write (default: 500000, 0 disables clip target).")
+  ap.add_argument("--target-bytes", type=int, default=0, help="Optional total output byte target (0 disables byte target).")
   ap.add_argument("--clip-seconds", type=float, default=2.0, help="Clip duration in seconds (default: 2.0).")
   ap.add_argument("--sample-rate", type=int, default=16_000, help="Output sample rate (default: 16000).")
   ap.add_argument("--split", type=str, default="train", help='Dataset split (default: "train").')
@@ -362,8 +368,12 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
   args = _parse_args()
-  if args.num_clips <= 0:
-    _die("--num-clips must be > 0.")
+  if args.num_clips < 0:
+    _die("--num-clips must be >= 0.")
+  if args.target_bytes < 0:
+    _die("--target-bytes must be >= 0.")
+  if args.num_clips <= 0 and args.target_bytes <= 0:
+    _die("Set at least one stopping target: --num-clips > 0 or --target-bytes > 0.")
   if args.clip_seconds <= 0:
     _die("--clip-seconds must be > 0.")
   if args.sample_rate <= 0:
@@ -399,15 +409,16 @@ def main() -> None:
       filtered.extend(["--num-streams", str(args.num_streams)])
 
     progress_re = re.compile(
-      r"^PROGRESS written=(\d+)/(\d+) seen=(\d+) skipped=(\d+) errors=(\d+) "
-      r"rate=([0-9.]+) clips/s elapsed=([0-9.]+)s"
+      r"^PROGRESS written=(\d+)/(\d+) written_bytes=(\d+)/(\d+) seen=(\d+) skipped=(\d+) errors=(\d+) "
+      r"rate=([0-9.]+) clips/s byte_rate=([0-9.]+) MiB/s elapsed=([0-9.]+)s"
     )
     done_re = re.compile(
-      r"^DONE written=(\d+) seen=(\d+) skipped=(\d+) elapsed=([0-9.]+)s rate=([0-9.]+) clips/s"
+      r"^DONE written=(\d+) written_bytes=(\d+) seen=(\d+) skipped=(\d+) elapsed=([0-9.]+)s "
+      r"rate=([0-9.]+) clips/s byte_rate=([0-9.]+) MiB/s"
     )
 
     stats = {
-      i: {"written": 0, "seen": 0, "skipped": 0, "errors": 0, "done": False}
+      i: {"written": 0, "written_bytes": 0, "seen": 0, "skipped": 0, "errors": 0, "done": False}
       for i in range(args.num_streams)
     }
     lock = threading.Lock()
@@ -419,6 +430,7 @@ def main() -> None:
       nonlocal last_agg_time, last_agg_written
       now = time.time()
       total_written = sum(s["written"] for s in stats.values())
+      total_written_bytes = sum(s["written_bytes"] for s in stats.values())
       total_seen = sum(s["seen"] for s in stats.values())
       total_skipped = sum(s["skipped"] for s in stats.values())
       total_errors = sum(s["errors"] for s in stats.values())
@@ -427,11 +439,12 @@ def main() -> None:
           return
       elapsed = max(1e-9, now - start_time)
       rate = total_written / elapsed
+      byte_rate_mib = (total_written_bytes / (1024.0 ** 2)) / elapsed
       total_target = args.num_clips * args.num_streams
       print(
         f"AGG written={total_written}/{total_target} seen={total_seen} "
         f"skipped={total_skipped} errors={total_errors} "
-        f"rate={rate:.2f} clips/s elapsed={elapsed:.1f}s",
+        f"rate={rate:.2f} clips/s byte_rate={byte_rate_mib:.2f} MiB/s elapsed={elapsed:.1f}s",
         file=sys.stderr,
         flush=True,
       )
@@ -444,17 +457,19 @@ def main() -> None:
       if m:
         with lock:
           stats[idx]["written"] = int(m.group(1))
-          stats[idx]["seen"] = int(m.group(3))
-          stats[idx]["skipped"] = int(m.group(4))
-          stats[idx]["errors"] = int(m.group(5))
+          stats[idx]["written_bytes"] = int(m.group(3))
+          stats[idx]["seen"] = int(m.group(5))
+          stats[idx]["skipped"] = int(m.group(6))
+          stats[idx]["errors"] = int(m.group(7))
           _maybe_agg()
         return
       m = done_re.match(line)
       if m:
         with lock:
           stats[idx]["written"] = int(m.group(1))
-          stats[idx]["seen"] = int(m.group(2))
-          stats[idx]["skipped"] = int(m.group(3))
+          stats[idx]["written_bytes"] = int(m.group(2))
+          stats[idx]["seen"] = int(m.group(3))
+          stats[idx]["skipped"] = int(m.group(4))
           stats[idx]["done"] = True
           _maybe_agg(force=True)
         return
@@ -529,7 +544,11 @@ def main() -> None:
 
   print(f"Streaming: laion/LAION-Audio-300M split={args.split}", file=sys.stderr)
   print(f"Stream worker: {args.stream_index}/{args.num_streams}", file=sys.stderr)
-  print(f"Target: {args.num_clips} clips of {args.clip_seconds:.3f}s ({clip_samples} samples) @ {args.sample_rate}Hz", file=sys.stderr)
+  print(
+    f"Target: clips={args.num_clips} bytes={args.target_bytes} "
+    f"of {args.clip_seconds:.3f}s ({clip_samples} samples) @ {args.sample_rate}Hz",
+    file=sys.stderr,
+  )
   print(f"Output: {out_dir} (shard_size={args.shard_size})", file=sys.stderr)
   print(f"HF transfer: {bool(os.environ.get('HF_HUB_ENABLE_HF_TRANSFER') == '1')}", file=sys.stderr)
   print(f"HF token set: {bool(os.environ.get('HF_TOKEN'))}", file=sys.stderr)
@@ -539,8 +558,11 @@ def main() -> None:
     print(f"HF_DATASETS_CACHE: {os.environ.get('HF_DATASETS_CACHE')}", file=sys.stderr)
 
   resume_written = 0
+  resume_written_bytes = 0
   resume_seen = 0
   resume_state_written: Optional[int] = None
+  resume_state_written_bytes: Optional[int] = None
+  resume_state_next_shard_idx: Optional[int] = None
   shard_idx = 0
   if args.resume:
     manifest_path = out_dir / "manifest.json"
@@ -580,27 +602,63 @@ def main() -> None:
           resume_seen = max(resume_seen, int(prev_seen))
         except Exception:
           pass
+      prev_num_bytes = manifest.get("num_bytes")
+      if prev_num_bytes is not None:
+        try:
+          resume_written_bytes = max(resume_written_bytes, int(prev_num_bytes))
+        except Exception:
+          pass
+      prev_next_shard_idx = manifest.get("next_shard_idx")
+      if prev_next_shard_idx is not None:
+        try:
+          resume_state_next_shard_idx = int(prev_next_shard_idx)
+        except Exception:
+          resume_state_next_shard_idx = resume_state_next_shard_idx
     state = _load_resume_state(out_dir)
     state_seen = state.get("seen")
     state_written = state.get("written")
+    state_written_bytes = state.get("written_bytes")
+    state_next_shard_idx = state.get("next_shard_idx")
     if state_written is not None:
       try:
         resume_state_written = int(state_written)
       except Exception:
         resume_state_written = None
+    if state_written_bytes is not None:
+      try:
+        resume_state_written_bytes = int(state_written_bytes)
+      except Exception:
+        resume_state_written_bytes = None
+    if state_next_shard_idx is not None:
+      try:
+        resume_state_next_shard_idx = int(state_next_shard_idx)
+      except Exception:
+        resume_state_next_shard_idx = resume_state_next_shard_idx
     if state_seen is not None:
       try:
         resume_seen = max(resume_seen, int(state_seen))
       except Exception:
         pass
-    resume_written, max_idx = _count_existing_clips(out_dir)
-    shard_idx = max_idx + 1 if max_idx >= 0 else 0
-    if resume_written >= args.num_clips:
-      print(f"Resume: already have {resume_written} clips, target {args.num_clips}. Nothing to do.", file=sys.stderr)
+    existing_written, max_idx, existing_written_bytes = _count_existing_shard_stats(out_dir)
+    resume_written = max(existing_written, int(resume_state_written or 0))
+    resume_written_bytes = max(existing_written_bytes, int(resume_state_written_bytes or 0), resume_written_bytes)
+    shard_idx = max(max_idx + 1 if max_idx >= 0 else 0, int(resume_state_next_shard_idx or 0))
+    clip_target_reached = bool(args.num_clips > 0 and resume_written >= args.num_clips)
+    byte_target_reached = bool(args.target_bytes > 0 and resume_written_bytes >= args.target_bytes)
+    if clip_target_reached or byte_target_reached:
+      print(
+        f"Resume: already have clips={resume_written} bytes={resume_written_bytes}. "
+        f"Targets clips={args.num_clips} bytes={args.target_bytes}. Nothing to do.",
+        file=sys.stderr,
+      )
       return
     if (
       resume_written > 0
-      and (resume_seen <= 0 or (resume_state_written is not None and resume_state_written < resume_written))
+      and (
+        resume_seen <= 0
+        or (resume_state_written is not None and resume_state_written < existing_written)
+        or (resume_state_written_bytes is not None and resume_state_written_bytes < existing_written_bytes)
+      )
       and (not args.allow_unsafe_resume)
     ):
       _die(
@@ -612,7 +670,7 @@ def main() -> None:
     while (out_dir / f"shard-{shard_idx:06d}.tar").exists():
       shard_idx += 1
     print(
-      f"Resume: found {resume_written} clips across existing shards. "
+      f"Resume: found clips={resume_written} bytes={resume_written_bytes}. "
       f"Starting at shard {shard_idx}. skip_seen={resume_seen}",
       file=sys.stderr,
     )
@@ -628,6 +686,7 @@ def main() -> None:
   )
 
   written = resume_written
+  written_bytes_finalized = resume_written_bytes
   seen = resume_seen
   skipped = 0
   stream_errors = 0
@@ -635,8 +694,33 @@ def main() -> None:
   shard: Optional[tarfile.TarFile] = None
   shard_tmp_path: Optional[Path] = None
   shard_final_path: Optional[Path] = None
+  persisted_written = resume_written
+  persisted_written_bytes = resume_written_bytes
+  persisted_seen = resume_seen
+  persisted_next_shard_idx = shard_idx
   t0 = time.perf_counter()
   last_state_save_t = 0.0
+
+  def _current_written_bytes() -> int:
+    total = int(written_bytes_finalized)
+    if shard_tmp_path is not None and shard_tmp_path.exists():
+      try:
+        total += int(shard_tmp_path.stat().st_size)
+      except Exception:
+        pass
+    return total
+
+  def _target_reached() -> bool:
+    clip_done = bool(args.num_clips > 0 and written >= args.num_clips)
+    byte_done = bool(args.target_bytes > 0 and _current_written_bytes() >= args.target_bytes)
+    return bool(clip_done or byte_done)
+
+  def _commit_finalized_state() -> None:
+    nonlocal persisted_written, persisted_written_bytes, persisted_seen, persisted_next_shard_idx
+    persisted_written = int(written)
+    persisted_written_bytes = int(written_bytes_finalized)
+    persisted_seen = int(seen)
+    persisted_next_shard_idx = int(shard_idx)
 
   def _persist_state(*, force: bool = False) -> None:
     nonlocal last_state_save_t
@@ -644,8 +728,9 @@ def main() -> None:
     if (not force) and ((now - last_state_save_t) < 5.0):
       return
     payload = {
-      "written": int(written),
-      "seen": int(seen),
+      "written": int(persisted_written),
+      "written_bytes": int(persisted_written_bytes),
+      "seen": int(persisted_seen),
       "skipped": int(skipped),
       "stream_errors": int(stream_errors),
       "num_streams": int(args.num_streams),
@@ -653,6 +738,7 @@ def main() -> None:
       "seed": int(args.seed),
       "shuffle_buffer": int(args.shuffle_buffer),
       "split": str(args.split),
+      "next_shard_idx": int(persisted_next_shard_idx),
       "updated_unix": int(time.time()),
     }
     try:
@@ -663,7 +749,7 @@ def main() -> None:
 
   try:
     stream_iter = iter(stream)
-    while written < args.num_clips:
+    while not _target_reached():
       try:
         ex = next(stream_iter)
         seen += 1
@@ -675,6 +761,9 @@ def main() -> None:
         if stream_errors >= args.max_stream_errors:
           print("ERROR: too many stream errors, aborting.", file=sys.stderr)
           break
+        # Advance past the bad source row so we do not loop on the same malformed
+        # dataset example forever after rebuilding the streaming iterator.
+        seen += 1
         stream_iter = iter(
           _iter_laion_stream(
             split=args.split,
@@ -708,7 +797,7 @@ def main() -> None:
         skipped += 1
         continue
 
-      remaining = args.num_clips - written
+      remaining = max(1, args.num_clips - written) if args.num_clips > 0 else len(results)
       for res in results[:remaining]:
         if shard is None:
           shard, shard_tmp_path, shard_final_path = _open_shard(out_dir, shard_idx)
@@ -725,26 +814,34 @@ def main() -> None:
 
         if in_shard >= args.shard_size:
           _finalize_shard(shard, shard_tmp_path, shard_final_path, has_data=True)
+          if shard_final_path is not None and shard_final_path.exists():
+            try:
+              written_bytes_finalized += int(shard_final_path.stat().st_size)
+            except Exception:
+              pass
           shard = None
           shard_tmp_path = None
           shard_final_path = None
           shard_idx += 1
           in_shard = 0
+          _commit_finalized_state()
           _persist_state()
 
         if args.progress_every and written % args.progress_every == 0:
           elapsed = max(1e-9, time.perf_counter() - t0)
           rate = written / elapsed
+          byte_rate_mib = (_current_written_bytes() / (1024.0 ** 2)) / elapsed
           print(
-            f"PROGRESS written={written}/{args.num_clips} "
+            f"PROGRESS written={written}/{max(args.num_clips, 0)} "
+            f"written_bytes={_current_written_bytes()}/{max(args.target_bytes, 0)} "
             f"seen={seen} skipped={skipped} errors={stream_errors} "
-            f"rate={rate:.2f} clips/s elapsed={elapsed:.1f}s",
+            f"rate={rate:.2f} clips/s byte_rate={byte_rate_mib:.2f} MiB/s elapsed={elapsed:.1f}s",
             file=sys.stderr,
             flush=True,
           )
           _persist_state()
 
-        if written >= args.num_clips:
+        if _target_reached():
           break
   finally:
     try:
@@ -754,14 +851,23 @@ def main() -> None:
         shard_final_path,
         has_data=(in_shard > 0),
       )
+      if in_shard > 0 and shard_final_path is not None and shard_final_path.exists():
+        try:
+          written_bytes_finalized += int(shard_final_path.stat().st_size)
+        except Exception:
+          pass
+        shard_idx += 1
+        in_shard = 0
     except Exception:
       pass
+    _commit_finalized_state()
     _persist_state(force=True)
 
   elapsed = max(1e-9, time.perf_counter() - t0)
   print(
-    f"DONE written={written} seen={seen} skipped={skipped} "
-    f"elapsed={elapsed:.1f}s rate={(written/elapsed):.2f} clips/s",
+    f"DONE written={written} written_bytes={written_bytes_finalized} seen={seen} skipped={skipped} "
+    f"elapsed={elapsed:.1f}s rate={(written/elapsed):.2f} clips/s "
+    f"byte_rate={(written_bytes_finalized/(1024.0**2))/elapsed:.2f} MiB/s",
     file=sys.stderr,
   )
 
@@ -781,7 +887,10 @@ def main() -> None:
     "num_streams": int(args.num_streams),
     "stream_index": int(args.stream_index),
     "resume_written": int(resume_written),
+    "resume_written_bytes": int(resume_written_bytes),
+    "num_bytes": int(written_bytes_finalized),
     "seen": int(seen),
+    "next_shard_idx": int(shard_idx),
     "created_unix": int(time.time()),
     "host": os.uname().nodename if hasattr(os, "uname") else "",
   }
