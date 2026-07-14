@@ -14,7 +14,7 @@ Example:
   python3 stream_laion_audio_clips.py \
     --out data/laion_audio_2s \
     --num-clips 500000 \
-    --shuffle-buffer 20000 \
+    --shuffle-buffer 2000 \
     --shard-size 1000
 
 Notes:
@@ -26,6 +26,8 @@ Notes:
 """
 
 import argparse
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import io
 import json
 import os
@@ -50,11 +52,14 @@ def _which(cmd: str) -> Optional[str]:
   return which(cmd)
 
 
-def _run_ffmpeg_decode_mp3_to_f32le(
+def _run_ffmpeg_decode_mp3_to_s16le(
   mp3_bytes: bytes, *, sample_rate: int, channels: int, timeout_s: int
 ) -> Tuple[bool, bytes, str]:
   """
-  Decode MP3 bytes -> raw f32le PCM bytes via ffmpeg.
+  Decode MP3 bytes -> raw signed 16-bit PCM bytes via ffmpeg.
+
+  The shard payload is PCM16 WAV, so decoding straight to s16le avoids a 4x
+  float32 intermediate and a second float-to-int conversion for every clip.
   Returns (ok, pcm_bytes, err_msg).
   """
   ffmpeg = _which("ffmpeg") or "ffmpeg"
@@ -67,7 +72,9 @@ def _run_ffmpeg_decode_mp3_to_f32le(
     "-i",
     "pipe:0",
     "-f",
-    "f32le",
+    "s16le",
+    "-acodec",
+    "pcm_s16le",
     "-ac",
     str(channels),
     "-ar",
@@ -90,25 +97,16 @@ def _run_ffmpeg_decode_mp3_to_f32le(
   return True, p.stdout, ""
 
 
-def _wav_bytes_from_f32_mono(wav_f32_mono: "Any", *, sample_rate: int) -> bytes:
-  """
-  Create WAV bytes from a float32 mono numpy array in [-1, 1].
-  Uses the stdlib wave module.
-  """
-  import numpy as np
+def _wav_bytes_from_pcm16_mono(pcm16le: bytes, *, sample_rate: int) -> bytes:
+  """Wrap little-endian mono PCM16 samples in a standard WAV container."""
   import wave
-
-  x = np.asarray(wav_f32_mono, dtype=np.float32)
-  x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-  x = np.clip(x, -1.0, 1.0)
-  pcm = (x * 32767.0).astype(np.int16)
 
   buf = io.BytesIO()
   with wave.open(buf, "wb") as wf:
     wf.setnchannels(1)
     wf.setsampwidth(2)  # int16
     wf.setframerate(int(sample_rate))
-    wf.writeframes(pcm.tobytes(order="C"))
+    wf.writeframes(pcm16le)
   return buf.getvalue()
 
 
@@ -129,7 +127,7 @@ def _iter_laion_stream(
   shard_index: int = 0,
   strict_partition: bool = True,
 ) -> Iterator[Dict[str, Any]]:
-  from datasets import Audio, load_dataset
+  from datasets import Features, Value, load_dataset
 
   ds = load_dataset("laion/LAION-Audio-300M", split=split, streaming=True)
   if num_shards > 1:
@@ -147,8 +145,12 @@ def _iter_laion_stream(
         if strict_partition:
           _die(f"Failed to apply stream partitioning via .shard(): {exc}")
         print(f"WARN: failed to shard stream partition ({exc}); overlap may occur.", file=sys.stderr)
-  # Avoid librosa/torchaudio decoding requirements by keeping raw bytes.
-  ds = ds.cast_column("audio.mp3", Audio(decode=False))
+  # Keep the embedded MP3 payload as a raw Arrow struct. Casting to
+  # Audio(decode=False) still enters torchcodec's encoder on some datasets 5.x
+  # streaming paths; plain Features avoids both decoding and that dependency.
+  features = ds.features.copy()
+  features["audio.mp3"] = {"bytes": Value("binary"), "path": Value("string")}
+  ds = ds.cast(Features(features))
   if shuffle_buffer and shuffle_buffer > 0:
     ds = ds.shuffle(buffer_size=int(shuffle_buffer), seed=int(seed))
   if skip and skip > 0 and hasattr(ds, "skip"):
@@ -182,14 +184,12 @@ def _make_clips_from_example(
   timeout_s: int,
   overlap_threshold_samples: int,
 ) -> Optional[List[ClipResult]]:
-  import numpy as np
-
   audio = ex.get("audio.mp3") or {}
   mp3_bytes = audio.get("bytes")
   if not isinstance(mp3_bytes, (bytes, bytearray)) or len(mp3_bytes) == 0:
     return None
 
-  ok, pcm_bytes, err = _run_ffmpeg_decode_mp3_to_f32le(
+  ok, pcm_bytes, err = _run_ffmpeg_decode_mp3_to_s16le(
     bytes(mp3_bytes),
     sample_rate=sample_rate,
     channels=1,
@@ -198,9 +198,9 @@ def _make_clips_from_example(
   if not ok or not pcm_bytes:
     return None
 
-  wav = np.frombuffer(pcm_bytes, dtype=np.float32)
+  total_samples = len(pcm_bytes) // 2
   starts = _segment_starts(
-    wav.size,
+    total_samples,
     clip_samples=clip_samples,
     overlap_threshold_samples=overlap_threshold_samples,
   )
@@ -213,8 +213,12 @@ def _make_clips_from_example(
   results: List[ClipResult] = []
   total_clips = len(starts)
   for idx, start in enumerate(starts):
-    clip = wav[start : start + clip_samples]
-    wav_bytes = _wav_bytes_from_f32_mono(clip, sample_rate=sample_rate)
+    byte_start = int(start) * 2
+    byte_end = byte_start + (int(clip_samples) * 2)
+    wav_bytes = _wav_bytes_from_pcm16_mono(
+      pcm_bytes[byte_start:byte_end],
+      sample_rate=sample_rate,
+    )
     clip_id = f"{key}-{start}"
     meta = {
       "clip_id": clip_id,
@@ -224,8 +228,8 @@ def _make_clips_from_example(
       "clip_end_sample": int(start + clip_samples),
       "clip_index": int(idx),
       "num_clips_from_source": int(total_clips),
-      "source_num_samples": int(wav.size),
-      "source_duration_s": float(wav.size) / float(sample_rate),
+      "source_num_samples": int(total_samples),
+      "source_duration_s": float(total_samples) / float(sample_rate),
       "source_key": key,
       "source_url": url,
       "metadata": ex.get("metadata.json", {}),
@@ -335,11 +339,13 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--clip-seconds", type=float, default=2.0, help="Clip duration in seconds (default: 2.0).")
   ap.add_argument("--sample-rate", type=int, default=16_000, help="Output sample rate (default: 16000).")
   ap.add_argument("--split", type=str, default="train", help='Dataset split (default: "train").')
-  ap.add_argument("--shuffle-buffer", type=int, default=20_000, help="Shuffle buffer size for streaming (default: 20000).")
+  ap.add_argument("--shuffle-buffer", type=int, default=2_000, help="Shuffle buffer size for streaming (default: 2000).")
   ap.add_argument("--seed", type=int, default=1337, help="RNG seed (default: 1337).")
   ap.add_argument("--shard-size", type=int, default=1000, help="Clips per tar shard (default: 1000).")
   ap.add_argument("--progress-every", type=int, default=500, help="Log progress every N written clips (default: 500).")
   ap.add_argument("--ffmpeg-timeout", type=int, default=60, help="Per-example ffmpeg decode timeout seconds (default: 60).")
+  ap.add_argument("--decode-workers", type=int, default=2, help="Concurrent ffmpeg decoders per stream worker.")
+  ap.add_argument("--decode-prefetch", type=int, default=4, help="Maximum ordered decode tasks buffered per stream worker.")
   ap.add_argument("--min-overlap-tail-sec", type=float, default=1.0, help="Only add overlapped clip if tail >= this many seconds (default: 1.0).")
   ap.add_argument("--max-stream-errors", type=int, default=100, help="Max streaming errors before abort (default: 100).")
   ap.add_argument("--max-examples", type=int, default=0, help="Optional cap on streamed examples (0 = no cap).")
@@ -380,6 +386,10 @@ def main() -> None:
     _die("--sample-rate must be > 0.")
   if args.shard_size <= 0:
     _die("--shard-size must be > 0.")
+  if args.decode_workers <= 0:
+    _die("--decode-workers must be > 0.")
+  if args.decode_prefetch < args.decode_workers:
+    _die("--decode-prefetch must be >= --decode-workers.")
   if args.min_overlap_tail_sec < 0:
     _die("--min-overlap-tail-sec must be >= 0.")
   if args.max_stream_errors <= 0:
@@ -533,6 +543,7 @@ def main() -> None:
   out_dir = args.out
   if args.num_streams > 1:
     out_dir = out_dir / f"stream-{args.stream_index:03d}"
+  out_dir.mkdir(parents=True, exist_ok=True)
 
   if not args.resume and not args.overwrite:
     existing = list(out_dir.glob("shard-*.tar"))
@@ -550,6 +561,10 @@ def main() -> None:
     file=sys.stderr,
   )
   print(f"Output: {out_dir} (shard_size={args.shard_size})", file=sys.stderr)
+  print(
+    f"Decode pipeline: workers={args.decode_workers} prefetch={args.decode_prefetch}",
+    file=sys.stderr,
+  )
   print(f"HF transfer: {bool(os.environ.get('HF_HUB_ENABLE_HF_TRANSFER') == '1')}", file=sys.stderr)
   print(f"HF token set: {bool(os.environ.get('HF_TOKEN'))}", file=sys.stderr)
   if os.environ.get("HF_HUB_CACHE"):
@@ -747,102 +762,129 @@ def main() -> None:
     except Exception:
       pass
 
+  def _write_results(results: Optional[List[ClipResult]]) -> None:
+    nonlocal shard, shard_tmp_path, shard_final_path, shard_idx
+    nonlocal written, written_bytes_finalized, in_shard, skipped
+    if not results:
+      skipped += 1
+      return
+    remaining = max(1, args.num_clips - written) if args.num_clips > 0 else len(results)
+    for res in results[:remaining]:
+      if shard is None:
+        shard, shard_tmp_path, shard_final_path = _open_shard(out_dir, shard_idx)
+
+      # Write wav + json.
+      _write_tar_member(shard, f"{res.clip_id}.wav", res.wav_bytes)
+      try:
+        meta_bytes = json.dumps(res.meta, ensure_ascii=False, default=str).encode("utf-8")
+      except Exception:
+        meta_bytes = json.dumps({"clip_id": res.clip_id}, ensure_ascii=False).encode("utf-8")
+      _write_tar_member(shard, f"{res.clip_id}.json", meta_bytes)
+      written += 1
+      in_shard += 1
+
+      if in_shard >= args.shard_size:
+        _finalize_shard(shard, shard_tmp_path, shard_final_path, has_data=True)
+        if shard_final_path is not None and shard_final_path.exists():
+          try:
+            written_bytes_finalized += int(shard_final_path.stat().st_size)
+          except Exception:
+            pass
+        shard = None
+        shard_tmp_path = None
+        shard_final_path = None
+        shard_idx += 1
+        in_shard = 0
+        _commit_finalized_state()
+        _persist_state()
+
+      if args.progress_every and written % args.progress_every == 0:
+        elapsed = max(1e-9, time.perf_counter() - t0)
+        rate = (written - resume_written) / elapsed
+        new_bytes = max(0, _current_written_bytes() - resume_written_bytes)
+        byte_rate_mib = (new_bytes / (1024.0 ** 2)) / elapsed
+        print(
+          f"PROGRESS written={written}/{max(args.num_clips, 0)} "
+          f"written_bytes={_current_written_bytes()}/{max(args.target_bytes, 0)} "
+          f"seen={seen} skipped={skipped} errors={stream_errors} "
+          f"rate={rate:.2f} clips/s byte_rate={byte_rate_mib:.2f} MiB/s elapsed={elapsed:.1f}s",
+          file=sys.stderr,
+          flush=True,
+        )
+        _persist_state()
+
+      if _target_reached():
+        break
+
   try:
     stream_iter = iter(stream)
-    while not _target_reached():
-      try:
-        ex = next(stream_iter)
-        seen += 1
-      except StopIteration:
-        break
-      except Exception as exc:  # noqa: BLE001
-        stream_errors += 1
-        print(f"WARN stream error: {exc} (errors={stream_errors})", file=sys.stderr)
-        if stream_errors >= args.max_stream_errors:
-          print("ERROR: too many stream errors, aborting.", file=sys.stderr)
-          break
-        # Advance past the bad source row so we do not loop on the same malformed
-        # dataset example forever after rebuilding the streaming iterator.
-        seen += 1
-        stream_iter = iter(
-          _iter_laion_stream(
-            split=args.split,
-            shuffle_buffer=args.shuffle_buffer,
-            seed=args.seed,
-            skip=seen,
-            num_shards=args.num_streams,
-            shard_index=args.stream_index,
-            strict_partition=args.strict_partition,
+    fetched_seen = int(seen)
+    source_exhausted = False
+    pending: "deque[Tuple[int, Optional[Future[List[ClipResult] | None]]]]" = deque()
+    executor = ThreadPoolExecutor(max_workers=args.decode_workers, thread_name_prefix="ffmpeg")
+    try:
+      while not _target_reached():
+        while (not source_exhausted) and len(pending) < args.decode_prefetch:
+          if args.max_examples > 0 and fetched_seen >= args.max_examples:
+            source_exhausted = True
+            break
+          try:
+            ex = next(stream_iter)
+            fetched_seen += 1
+          except StopIteration:
+            source_exhausted = True
+            break
+          except Exception as exc:  # noqa: BLE001
+            stream_errors += 1
+            fetched_seen += 1
+            pending.append((fetched_seen, None))
+            print(f"WARN stream error: {exc} (errors={stream_errors})", file=sys.stderr)
+            if stream_errors >= args.max_stream_errors:
+              print("ERROR: too many stream errors, aborting.", file=sys.stderr)
+              source_exhausted = True
+              break
+            stream_iter = iter(
+              _iter_laion_stream(
+                split=args.split,
+                shuffle_buffer=args.shuffle_buffer,
+                seed=args.seed,
+                skip=fetched_seen,
+                num_shards=args.num_streams,
+                shard_index=args.stream_index,
+                strict_partition=args.strict_partition,
+              )
+            )
+            continue
+
+          future = executor.submit(
+            _make_clips_from_example,
+            ex,
+            clip_samples=clip_samples,
+            sample_rate=args.sample_rate,
+            timeout_s=int(args.ffmpeg_timeout),
+            overlap_threshold_samples=overlap_threshold_samples,
           )
-        )
-        continue
+          pending.append((fetched_seen, future))
 
-      if args.max_examples and args.max_examples > 0 and seen > args.max_examples:
-        break
+        if not pending:
+          break
 
-      try:
-        results = _make_clips_from_example(
-          ex,
-          clip_samples=clip_samples,
-          sample_rate=args.sample_rate,
-          timeout_s=int(args.ffmpeg_timeout),
-          overlap_threshold_samples=overlap_threshold_samples,
-        )
-      except Exception as exc:  # noqa: BLE001
-        skipped += 1
-        print(f"WARN decode error: {exc}", file=sys.stderr)
-        continue
-
-      if not results:
-        skipped += 1
-        continue
-
-      remaining = max(1, args.num_clips - written) if args.num_clips > 0 else len(results)
-      for res in results[:remaining]:
-        if shard is None:
-          shard, shard_tmp_path, shard_final_path = _open_shard(out_dir, shard_idx)
-
-        # Write wav + json.
-        _write_tar_member(shard, f"{res.clip_id}.wav", res.wav_bytes)
+        example_seen, future = pending.popleft()
+        seen = int(example_seen)
+        if future is None:
+          skipped += 1
+          continue
         try:
-          meta_bytes = json.dumps(res.meta, ensure_ascii=False, default=str).encode("utf-8")
-        except Exception:
-          meta_bytes = json.dumps({"clip_id": res.clip_id}, ensure_ascii=False).encode("utf-8")
-        _write_tar_member(shard, f"{res.clip_id}.json", meta_bytes)
-        written += 1
-        in_shard += 1
-
-        if in_shard >= args.shard_size:
-          _finalize_shard(shard, shard_tmp_path, shard_final_path, has_data=True)
-          if shard_final_path is not None and shard_final_path.exists():
-            try:
-              written_bytes_finalized += int(shard_final_path.stat().st_size)
-            except Exception:
-              pass
-          shard = None
-          shard_tmp_path = None
-          shard_final_path = None
-          shard_idx += 1
-          in_shard = 0
-          _commit_finalized_state()
-          _persist_state()
-
-        if args.progress_every and written % args.progress_every == 0:
-          elapsed = max(1e-9, time.perf_counter() - t0)
-          rate = written / elapsed
-          byte_rate_mib = (_current_written_bytes() / (1024.0 ** 2)) / elapsed
-          print(
-            f"PROGRESS written={written}/{max(args.num_clips, 0)} "
-            f"written_bytes={_current_written_bytes()}/{max(args.target_bytes, 0)} "
-            f"seen={seen} skipped={skipped} errors={stream_errors} "
-            f"rate={rate:.2f} clips/s byte_rate={byte_rate_mib:.2f} MiB/s elapsed={elapsed:.1f}s",
-            file=sys.stderr,
-            flush=True,
-          )
-          _persist_state()
-
-        if _target_reached():
-          break
+          _write_results(future.result())
+        except Exception as exc:  # noqa: BLE001
+          skipped += 1
+          print(f"WARN decode error: {exc}", file=sys.stderr)
+    finally:
+      while pending:
+        _example_seen, future = pending.popleft()
+        if future is not None:
+          future.cancel()
+      executor.shutdown(wait=True, cancel_futures=True)
   finally:
     try:
       _finalize_shard(
@@ -866,8 +908,8 @@ def main() -> None:
   elapsed = max(1e-9, time.perf_counter() - t0)
   print(
     f"DONE written={written} written_bytes={written_bytes_finalized} seen={seen} skipped={skipped} "
-    f"elapsed={elapsed:.1f}s rate={(written/elapsed):.2f} clips/s "
-    f"byte_rate={(written_bytes_finalized/(1024.0**2))/elapsed:.2f} MiB/s",
+    f"elapsed={elapsed:.1f}s rate={((written-resume_written)/elapsed):.2f} clips/s "
+    f"byte_rate={(max(0, written_bytes_finalized-resume_written_bytes)/(1024.0**2))/elapsed:.2f} MiB/s",
     file=sys.stderr,
   )
 
@@ -895,6 +937,11 @@ def main() -> None:
     "host": os.uname().nodename if hasattr(os, "uname") else "",
   }
   (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+  if (not _target_reached()) and args.max_examples <= 0:
+    _die(
+      "Streaming ended before reaching a configured target "
+      f"(clips={written}/{args.num_clips}, bytes={written_bytes_finalized}/{args.target_bytes})."
+    )
 
 
 if __name__ == "__main__":

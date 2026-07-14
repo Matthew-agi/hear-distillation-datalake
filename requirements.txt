@@ -1,18 +1,4 @@
-# Install torch separately (CPU vs CUDA wheel is environment-specific).
-# Example CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu124
-# Example CPU:  pip install torch
-
-numpy
-scipy
-soundfile
-
-datasets
-huggingface_hub
-transformers
-hf_transfer
-
-timm
-scikit-learn
-
-# Optional logging
-wandb
+# Compatibility entrypoint for tools that still expect requirements.txt.
+# The canonical dependency set lives in pyproject.toml; scripts/bootstrap.sh
+# additionally selects the PyTorch wheel matching the host GPU driver.
+-e .
