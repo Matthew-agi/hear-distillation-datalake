@@ -67,6 +67,15 @@ def _import_audio_utils(repo_root: Path):
 
 
 def _import_preprocess_audio(repo_root: Path):
+  src_root = repo_root / "src"
+  if src_root.exists() and str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+  try:
+    from hear_distill.audio import preprocess_audio
+
+    return preprocess_audio
+  except Exception:
+    pass
   audio_utils = _import_audio_utils(repo_root)
   if not hasattr(audio_utils, "preprocess_audio"):
     _die("`audio_utils` import succeeded but has no `preprocess_audio` attribute.")
@@ -74,6 +83,15 @@ def _import_preprocess_audio(repo_root: Path):
 
 
 def _import_preprocess_audio_full_clip(repo_root: Path):
+  src_root = repo_root / "src"
+  if src_root.exists() and str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+  try:
+    from hear_distill.audio import preprocess_audio_full_clip
+
+    return preprocess_audio_full_clip
+  except Exception:
+    pass
   audio_utils = _import_audio_utils(repo_root)
   mel_pcen = getattr(audio_utils, "_mel_pcen", None)
   resize = getattr(audio_utils, "_torch_resize_bilinear_tf_compat", None)
@@ -1946,7 +1964,6 @@ def _collect_embeddings(
   skipped_label = 0
   skipped_audio = 0
   start_t = time.perf_counter()
-  last_log = start_t
   if log_every:
     prefix = f"{log_prefix} " if log_prefix else ""
     max_tag = f" max_items={max_items}" if max_items is not None else ""
@@ -1986,7 +2003,6 @@ def _collect_embeddings(
         f"rate={rate:.2f}/s elapsed={elapsed/60:.1f}m{eta}",
         flush=True,
       )
-      last_log = now
   _flush()
 
   if key_fn is not None:
@@ -2317,7 +2333,7 @@ def main() -> None:
   else:
     print(f"Embedding model: hear-hf ({args.hf_model_id}, dim={embedding_dim})")
   if args.full_clip:
-    print(f"Clip mode: full clip (no chunking, whole resampled clip per forward)")
+    print("Clip mode: full clip (no chunking, whole resampled clip per forward)")
   else:
     print(f"Clip mode: crop ({args.clip_seconds:.2f}s @ {args.target_sr}Hz ({clip_samples} samples))")
 

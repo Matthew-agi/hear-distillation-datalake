@@ -112,6 +112,16 @@ def _set_cpu_affinity(cpu_ids: list[int]) -> None:
 def _import_preprocess_audio(repo_root: Path):
   import importlib
 
+  src_root = repo_root / "src"
+  if src_root.exists() and str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+  try:
+    from hear_distill.audio import preprocess_audio
+
+    return preprocess_audio
+  except Exception:
+    pass
+
   candidate_roots: List[Path] = [repo_root, repo_root.parent]
   checked: List[Path] = []
   last_exc: Optional[Exception] = None

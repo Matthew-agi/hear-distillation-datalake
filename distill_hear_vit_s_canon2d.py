@@ -48,6 +48,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
+from adaptive_warmup import CriticalLREstimate, estimate_critical_learning_rate
+
 
 def _die(msg: str) -> "None":
   raise SystemExit(msg)
@@ -57,6 +59,16 @@ def _import_preprocess_audio(repo_root: Path):
   import sys
 
   import importlib
+
+  src_root = repo_root / "src"
+  if src_root.exists() and str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+  try:
+    from hear_distill.audio import AudioPreprocessor
+
+    return AudioPreprocessor()
+  except Exception:
+    pass
 
   candidate_roots: List[Path] = [repo_root, repo_root.parent]
   checked: List[Path] = []
@@ -88,6 +100,12 @@ def _import_preprocess_audio(repo_root: Path):
 
 
 def _decode_wav_bytes(wav_bytes: bytes, target_sr: int) -> Optional[torch.Tensor]:
+  try:
+    from hear_distill.audio import decode_wav_bytes
+
+    return decode_wav_bytes(wav_bytes, target_sr)
+  except ImportError:
+    pass
   try:
     import soundfile as sf
   except Exception as exc:  # noqa: BLE001
@@ -567,12 +585,18 @@ def _parse_args() -> argparse.Namespace:
     default=True,
     help="Compile the student+projection+loss path with torch.compile.",
   )
+  ap.add_argument(
+    "--compile-preprocess",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Compile the cached mel-PCEN preprocessing module.",
+  )
   ap.add_argument("--compile-mode", type=str, default="default", help="torch.compile mode.")
   ap.add_argument(
     "--compile-dynamic",
     action=argparse.BooleanOptionalAction,
-    default=True,
-    help="Enable dynamic-shape torch.compile to reduce recompiles from batch changes.",
+    default=False,
+    help="Enable dynamic-shape torch.compile (off by default for faster fixed batches).",
   )
   ap.add_argument(
     "--fused-adamw",
@@ -601,7 +625,7 @@ def _parse_args() -> argparse.Namespace:
     default=True,
     help="Require optimizer state to be present when resuming (recommended for true continuation).",
   )
-  ap.add_argument("--gns-every", type=int, default=5, help="Estimate gradient noise scale every N steps (0 disables).")
+  ap.add_argument("--gns-every", type=int, default=0, help="Estimate gradient noise scale every N steps (0 disables).")
   ap.add_argument("--gns-param-sample", type=int, default=200000, help="Max gradient elements to sample for GNS estimate.")
   ap.add_argument("--teacher-id", type=str, default="google/hear-pytorch", help="Teacher model id.")
   ap.add_argument("--clip-seconds", type=float, default=2.0, help="Clip length in seconds.")
@@ -610,7 +634,18 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--repeat", action="store_true", help="Repeat over shards indefinitely (recommended).")
   ap.add_argument("--live-shard-refresh", action="store_true", help="Refresh shard list while training to ingest newly written shards.")
   ap.add_argument("--shard-refresh-sec", type=float, default=30.0, help="Seconds between shard list refreshes when --live-shard-refresh is enabled.")
-  ap.add_argument("--amp", action="store_true", help="Use AMP (cuda only).")
+  ap.add_argument(
+    "--amp",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Use mixed precision (defaults on for CUDA, off for CPU).",
+  )
+  ap.add_argument(
+    "--amp-dtype",
+    choices=["auto", "float16", "bfloat16"],
+    default="auto",
+    help="CUDA autocast dtype; auto prefers bfloat16 when supported.",
+  )
   ap.add_argument("--seed", type=int, default=1337, help="RNG seed.")
   ap.add_argument("--loss-mse-weight", type=float, default=1.0, help="Weight for MSE loss.")
   ap.add_argument("--loss-contrastive-weight", type=float, default=0.5, help="Weight for contrastive loss.")
@@ -1669,29 +1704,19 @@ def _cuda_free_memory_fraction(device: torch.device) -> Optional[float]:
   return float(free_bytes) / float(total_bytes)
 
 
-def _batch_total_loss(
-  batch: torch.Tensor,
+def _probe_total_loss(
+  spec: torch.Tensor,
+  target: torch.Tensor,
   *,
-  preprocess_audio,
-  teacher: nn.Module,
   student: nn.Module,
   proj: nn.Module,
-  device: torch.device,
   contrastive_temp: float,
   loss_mse_weight: float,
   loss_contrastive_weight: float,
   loss_relational_weight: float,
   autocast_ctx,
-  teacher_autocast_ctx,
 ) -> float:
-  batch = batch.to(device, non_blocking=True)
   with torch.inference_mode():
-    spec = preprocess_audio(batch)
-    target = _teacher_targets_from_spec(
-      teacher,
-      spec,
-      teacher_autocast_ctx=teacher_autocast_ctx,
-    )
     with autocast_ctx():
       student_feats = _student_features(student, spec)
       student_emb = proj(student_feats)
@@ -1704,57 +1729,6 @@ def _batch_total_loss(
         loss_relational_weight=loss_relational_weight,
       )
   return float(loss_total.detach().cpu())
-
-
-def _adamw_step_directions(optim: torch.optim.Optimizer) -> List[Tuple[torch.nn.Parameter, torch.Tensor]]:
-  out: List[Tuple[torch.nn.Parameter, torch.Tensor]] = []
-  with torch.no_grad():
-    for group in optim.param_groups:
-      beta1, beta2 = group["betas"]
-      eps = float(group["eps"])
-      weight_decay = float(group.get("weight_decay", 0.0))
-      amsgrad = bool(group.get("amsgrad", False))
-      for p in group["params"]:
-        grad = p.grad
-        if grad is None:
-          continue
-        if grad.is_sparse:
-          continue
-        state = optim.state.get(p, {})
-        exp_avg = state.get("exp_avg")
-        exp_avg_sq = state.get("exp_avg_sq")
-        if exp_avg is None:
-          exp_avg_cur = grad.detach().clone().mul_(1.0 - beta1)
-        else:
-          exp_avg_cur = exp_avg.detach().clone().mul_(beta1).add_(grad.detach(), alpha=(1.0 - beta1))
-        if exp_avg_sq is None:
-          exp_avg_sq_cur = grad.detach().clone().pow_(2).mul_(1.0 - beta2)
-        else:
-          exp_avg_sq_cur = exp_avg_sq.detach().clone().mul_(beta2).addcmul_(
-            grad.detach(),
-            grad.detach(),
-            value=(1.0 - beta2),
-          )
-        if amsgrad:
-          max_exp_avg_sq = state.get("max_exp_avg_sq")
-          if max_exp_avg_sq is not None:
-            exp_avg_sq_cur = torch.maximum(max_exp_avg_sq.detach(), exp_avg_sq_cur)
-        step_t = state.get("step", 0)
-        if torch.is_tensor(step_t):
-          step_idx = int(step_t.item())
-        else:
-          step_idx = int(step_t)
-        step_next = step_idx + 1
-        bias_correction1 = 1.0 - (beta1 ** step_next)
-        bias_correction2 = 1.0 - (beta2 ** step_next)
-        if bias_correction1 <= 0.0 or bias_correction2 <= 0.0:
-          continue
-        denom = exp_avg_sq_cur.sqrt().div_(math.sqrt(bias_correction2)).add_(eps)
-        direction = exp_avg_cur.div_(bias_correction1).div_(denom)
-        if weight_decay != 0.0:
-          direction = direction.add(p.detach(), alpha=weight_decay)
-        out.append((p, direction))
-  return out
 
 
 def _estimate_critical_lr(
@@ -1776,95 +1750,56 @@ def _estimate_critical_lr(
   current_lr: float,
   prev_estimate: Optional[float],
   max_lr_cap: Optional[float],
-) -> Tuple[Optional[float], Iterator[torch.Tensor]]:
-  directions = _adamw_step_directions(optim)
-  if not directions:
+) -> Tuple[Optional[CriticalLREstimate], Iterator[torch.Tensor]]:
+  has_dense_gradient = any(
+    parameter.grad is not None and not parameter.grad.is_sparse
+    for group in optim.param_groups
+    for parameter in group["params"]
+  )
+  if not has_dense_gradient:
     return None, data_iter
   batch, data_iter = _next_batch(loader, data_iter)
   student_was_training = student.training
   proj_was_training = proj.training
   student.eval()
   proj.eval()
-  applied_lr = 0.0
   try:
-    base_loss = _batch_total_loss(
-      batch,
-      preprocess_audio=preprocess_audio,
-      teacher=teacher,
-      student=student,
-      proj=proj,
-      device=device,
-      contrastive_temp=contrastive_temp,
-      loss_mse_weight=loss_mse_weight,
-      loss_contrastive_weight=loss_contrastive_weight,
-      loss_relational_weight=loss_relational_weight,
-      autocast_ctx=autocast_ctx,
-      teacher_autocast_ctx=teacher_autocast_ctx,
-    )
-    if not math.isfinite(base_loss):
-      return None, data_iter
-    loss_limit = base_loss * 1.0001
-
-    def _set_virtual_lr(target_lr: float) -> None:
-      nonlocal applied_lr
-      delta = float(target_lr) - float(applied_lr)
-      if abs(delta) <= 0.0:
-        return
-      with torch.no_grad():
-        for p, direction in directions:
-          p.add_(direction, alpha=-delta)
-      applied_lr = float(target_lr)
-
-    def _eval_at(lr_value: float) -> float:
-      _set_virtual_lr(lr_value)
-      return _batch_total_loss(
-        batch,
-        preprocess_audio=preprocess_audio,
-        teacher=teacher,
+    # The virtual LR steps only modify the student and projection. Cache the
+    # invariant preprocessing and frozen-teacher target once for the entire
+    # line search instead of repeating both for every candidate LR.
+    batch = batch.to(device, non_blocking=True)
+    with torch.inference_mode():
+      spec = preprocess_audio(batch)
+      target = _teacher_targets_from_spec(
+        teacher,
+        spec,
+        teacher_autocast_ctx=teacher_autocast_ctx,
+      )
+    def _held_out_loss() -> float:
+      return _probe_total_loss(
+        spec,
+        target,
         student=student,
         proj=proj,
-        device=device,
         contrastive_temp=contrastive_temp,
         loss_mse_weight=loss_mse_weight,
         loss_contrastive_weight=loss_contrastive_weight,
         loss_relational_weight=loss_relational_weight,
         autocast_ctx=autocast_ctx,
-        teacher_autocast_ctx=teacher_autocast_ctx,
       )
 
-    low = 0.0
-    high: Optional[float] = None
-    probe = max(float(current_lr), 1e-8)
-    if prev_estimate is not None and math.isfinite(prev_estimate) and prev_estimate > 0:
-      probe = max(probe, float(prev_estimate))
-    max_probe = max(probe, 1e-8) * (2.0 ** 12)
-    if max_lr_cap is not None and max_lr_cap > 0:
-      max_probe = max(max_probe, float(max_lr_cap) * 2.0)
-    for _ in range(12):
-      probe = min(probe, max_probe)
-      loss_probe = _eval_at(probe)
-      if (not math.isfinite(loss_probe)) or loss_probe > loss_limit:
-        high = probe
-        break
-      low = probe
-      if probe >= max_probe:
-        break
-      probe = min(max_probe, probe * 2.0)
-    if high is None:
-      return (low if low > 0.0 else probe), data_iter
-    for _ in range(10):
-      mid = 0.5 * (low + high)
-      loss_mid = _eval_at(mid)
-      if math.isfinite(loss_mid) and loss_mid <= loss_limit:
-        low = mid
-      else:
-        high = mid
-    return (low if low > 0.0 else None), data_iter
+    try:
+      estimate = estimate_critical_learning_rate(
+        _held_out_loss,
+        optimizer=optim,
+        current_lr=current_lr,
+        previous_estimate=prev_estimate,
+        max_lr=max_lr_cap,
+      )
+    except FloatingPointError:
+      return None, data_iter
+    return estimate, data_iter
   finally:
-    if applied_lr != 0.0:
-      with torch.no_grad():
-        for p, direction in directions:
-          p.add_(direction, alpha=applied_lr)
     if student_was_training:
       student.train()
     if proj_was_training:
@@ -2178,9 +2113,19 @@ def main() -> None:
   device = torch.device(args.device)
   if device.type == "cuda" and not torch.cuda.is_available():
     _die("CUDA requested but not available.")
+  if device.type == "cuda":
+    if hasattr(torch, "set_float32_matmul_precision"):
+      torch.set_float32_matmul_precision("high")
+    if hasattr(torch.backends, "cudnn"):
+      torch.backends.cudnn.benchmark = True
+      torch.backends.cudnn.allow_tf32 = True
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+      torch.backends.cuda.matmul.allow_tf32 = True
 
   repo_root = Path(__file__).resolve().parent
   preprocess_audio = _import_preprocess_audio(repo_root)
+  if isinstance(preprocess_audio, nn.Module):
+    preprocess_audio = preprocess_audio.eval().to(device)
 
   # Teacher
   from transformers import AutoModel
@@ -2270,15 +2215,25 @@ def main() -> None:
       optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
   else:
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
-  if args.amp and device.type == "cuda":
-    try:
-      scaler = torch.amp.GradScaler("cuda")
-      def _autocast():
-        return torch.amp.autocast(device_type="cuda")
-    except Exception:
-      scaler = torch.cuda.amp.GradScaler()
-      def _autocast():
-        return torch.cuda.amp.autocast()
+  amp_enabled = bool(device.type == "cuda" if args.amp is None else args.amp)
+  amp_dtype = torch.float32
+  if amp_enabled and device.type == "cuda":
+    use_bfloat16 = args.amp_dtype == "bfloat16" or (
+      args.amp_dtype == "auto"
+      and hasattr(torch.cuda, "is_bf16_supported")
+      and torch.cuda.is_bf16_supported()
+    )
+    amp_dtype = torch.bfloat16 if use_bfloat16 else torch.float16
+    if amp_dtype == torch.float16:
+      try:
+        scaler = torch.amp.GradScaler("cuda")
+      except Exception:
+        scaler = torch.cuda.amp.GradScaler()
+    else:
+      scaler = _NoopScaler()
+
+    def _autocast():
+      return torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
   else:
     scaler = _NoopScaler()
     def _autocast():
@@ -2286,7 +2241,10 @@ def main() -> None:
   _teacher_autocast = _autocast
 
   optimizer_mode = str(args.optimizer_mode)
-  perf_enabled = optimizer_mode in {"diagnostic", "teacher-superbatch"}
+  # CUDA event timing synchronizes the device in _StepTimer.finish(). Keep it
+  # exclusive to explicit diagnostics; teacher superbatching is a throughput
+  # mode and must not introduce a full GPU barrier after every step.
+  perf_enabled = optimizer_mode == "diagnostic"
   teacher_superbatch_enabled = optimizer_mode == "teacher-superbatch"
   teacher_superbatch_runtime_factor = int(args.teacher_batch_factor if teacher_superbatch_enabled else 1)
   perf_window = _PerfWindow() if perf_enabled else None
@@ -2302,6 +2260,7 @@ def main() -> None:
   student_loss_runner: nn.Module = student_loss_module
   teacher_compiled_active = False
   student_compiled_active = False
+  preprocess_compiled_active = False
 
   def _compile_kwargs() -> Dict[str, object]:
     return {
@@ -2325,6 +2284,25 @@ def main() -> None:
       )
     except Exception as exc:
       print(f"Warning: failed to compile teacher ({exc}); leaving teacher eager.", flush=True)
+
+  def _enable_preprocess_compile() -> None:
+    nonlocal preprocess_audio, preprocess_compiled_active
+    if preprocess_compiled_active or not args.compile_preprocess:
+      return
+    if not isinstance(preprocess_audio, nn.Module):
+      return
+    if not compile_available:
+      print("Warning: torch.compile unavailable; leaving preprocessing eager.", flush=True)
+      return
+    try:
+      preprocess_audio = torch.compile(preprocess_audio, **_compile_kwargs())
+      preprocess_compiled_active = True
+      print(
+        f"compile preprocess=1 mode={args.compile_mode} dynamic={int(bool(args.compile_dynamic))}",
+        flush=True,
+      )
+    except Exception as exc:
+      print(f"Warning: failed to compile preprocessing ({exc}); leaving eager.", flush=True)
 
   def _enable_student_compile(reason: str) -> None:
     nonlocal student_loss_runner, student_compiled_active
@@ -2590,6 +2568,7 @@ def main() -> None:
     lr_gns_ref_batch = _resolve_lr_gns_ref_batch(current_train_batch)
     print(f"Resumed training from {Path(resume_ckpt_path)} at step={step}.", flush=True)
 
+  _enable_preprocess_compile()
   _enable_teacher_compile()
   if (not auto_warmup_enabled) or step >= args.auto_warmup_steps:
     _enable_student_compile("startup")
@@ -2771,7 +2750,10 @@ def main() -> None:
   )
   print(
     "Runtime backend: "
+    f"amp={int(amp_enabled and device.type == 'cuda')} "
+    f"amp_dtype={str(amp_dtype).removeprefix('torch.')} "
     f"fused_adamw={int(fused_adamw_active)} "
+    f"compile_preprocess={'on' if preprocess_compiled_active else 'off'} "
     f"compile_teacher={'on' if teacher_compiled_active else 'off'} "
     f"compile_student={student_compile_status}",
     flush=True,
@@ -3186,7 +3168,13 @@ def main() -> None:
             target,
           )
           loss = loss_total / args.grad_accum
-        if not torch.isfinite(loss_total.detach()):
+        finite_loss = torch.isfinite(loss_total.detach()).all()
+        if device.type == "cuda" and hasattr(torch, "_assert_async"):
+          torch._assert_async(  # type: ignore[attr-defined]
+            finite_loss,
+            f"Non-finite training loss at step={step} lr={cur_lr:.3e} batch={current_train_batch}",
+          )
+        elif not bool(finite_loss):
           raise RuntimeError(
             "Non-finite training loss "
             f"at step={step} lr={cur_lr:.3e} batch={current_train_batch} "
@@ -3226,7 +3214,7 @@ def main() -> None:
         if step < auto_warmup_lr_freeze_step:
           if scaler.is_enabled():
             scaler.unscale_(optim)
-          crit_lr_est, data_iter = _estimate_critical_lr(
+          crit_lr_result, data_iter = _estimate_critical_lr(
             loader=loader,
             data_iter=data_iter,
             preprocess_audio=preprocess_audio,
@@ -3245,13 +3233,17 @@ def main() -> None:
             prev_estimate=(auto_warmup_ema_crit_lr if auto_warmup_ema_crit_lr is not None else auto_warmup_last_crit_lr),
             max_lr_cap=auto_warmup_max_lr,
           )
-          if crit_lr_est is not None and math.isfinite(crit_lr_est) and crit_lr_est > 0:
+          if (
+            crit_lr_result is not None
+            and math.isfinite(crit_lr_result.critical_lr)
+            and crit_lr_result.critical_lr > 0
+          ):
             beta = float(args.auto_warmup_ema_beta)
-            filtered_crit_lr = float(crit_lr_est)
+            filtered_crit_lr = float(crit_lr_result.critical_lr)
             if auto_warmup_first_crit_lr is None:
               auto_warmup_first_crit_lr = float(filtered_crit_lr)
             auto_warmup_last_crit_lr = float(filtered_crit_lr)
-            auto_warmup_last_crit_sharpness = 1.0 / max(float(filtered_crit_lr), 1e-12)
+            auto_warmup_last_crit_sharpness = float(crit_lr_result.critical_sharpness)
             current_safe_lr = float(args.auto_warmup_lr_safety_frac) * max(float(filtered_crit_lr), 0.0)
             if auto_warmup_ema_crit_lr is None:
               auto_warmup_ema_crit_lr = float(filtered_crit_lr)
@@ -3343,7 +3335,8 @@ def main() -> None:
     if perf_enabled and perf_window is not None:
       step_perf["step_ms"] = (time.perf_counter() - step_wall_start) * 1000.0
       perf_window.add(step_perf)
-    _maybe_backoff_near_oom()
+    if (step + 1) % args.optimizer_log_every == 0:
+      _maybe_backoff_near_oom()
     step += 1
     auto_warmup_last_safe_batch_size = int(current_train_batch)
 

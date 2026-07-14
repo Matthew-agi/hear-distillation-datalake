@@ -57,6 +57,29 @@ def _disk_free_gb(path: Path) -> float:
   return usage.free / GIB
 
 
+def _logical_reserve_bytes(
+  *,
+  active_bytes: int,
+  origin_active_bytes: int,
+  produced_since_origin_bytes: int,
+  consumed_since_origin_bytes: int,
+  pruned_since_origin_bytes: int = 0,
+) -> int:
+  logical = max(
+    0,
+    int(origin_active_bytes)
+    + int(produced_since_origin_bytes)
+    - int(consumed_since_origin_bytes)
+    - int(pruned_since_origin_bytes),
+  )
+  return min(max(0, int(active_bytes)), logical)
+
+
+def _prune_target_bytes(*, active_bytes: int, reserve_bytes: int, reserve_low_bytes: int) -> int:
+  surplus = max(0, int(reserve_bytes) - int(reserve_low_bytes))
+  return max(int(reserve_low_bytes), int(active_bytes) - surplus)
+
+
 def _truthy(value: Optional[str]) -> bool:
   if value is None:
     return False
@@ -942,7 +965,7 @@ def _parse_args() -> argparse.Namespace:
 
   ap.add_argument("--clip-seconds", type=float, default=2.0)
   ap.add_argument("--sample-rate", type=int, default=16000)
-  ap.add_argument("--shuffle-buffer", type=int, default=20000)
+  ap.add_argument("--shuffle-buffer", type=int, default=2000)
   ap.add_argument("--shard-size", type=int, default=1000)
   ap.add_argument("--hf-transfer", action="store_true")
   ap.add_argument("--hf-token", type=str, default=None)
@@ -1283,7 +1306,7 @@ def main() -> None:
     if curation_state["train_committed_clips"] > 0
     else estimated_clip_bytes
   )
-  last_consumed_total_bytes = int(current_step * args.train_batch_size * args.train_grad_accum * avg_train_clip_bytes)
+  last_consumed_total_bytes = 0
   last_written_total_bytes = int(curation_state["train_committed_tar_bytes"])
   deleted_bytes_total = 0
   train_inventory: List[Tuple[Path, str, int, int, int, int]] = []
@@ -1749,6 +1772,15 @@ def main() -> None:
   if not _has_visible_shards(train_lake_dir):
     _bootstrap_until_first_train_shard()
 
+  # Anchor reserve accounting at this invocation. Subtracting lifetime training
+  # steps from the current on-disk lake double-counts bytes already pruned and
+  # makes reserve collapse to zero on long/resumed runs.
+  train_inventory = _build_area_inventory(train_lake_dir)
+  reserve_origin_active_bytes = sum(rec[2] for rec in train_inventory)
+  reserve_origin_written_bytes = int(curation_state["train_committed_tar_bytes"])
+  reserve_origin_step = int(current_step)
+  last_written_total_bytes = reserve_origin_written_bytes
+
   train_proc = _start_training("stable", stable_train_cmd)
   last_status_t = 0.0
 
@@ -1862,14 +1894,21 @@ def main() -> None:
         if int(curation_state["train_committed_clips"]) > 0
         else float(estimated_clip_bytes)
       )
-      consumed_total_clips = current_step * args.train_batch_size * args.train_grad_accum
+      consumed_total_clips = max(0, current_step - reserve_origin_step) * args.train_batch_size * args.train_grad_accum
       consumed_total_bytes = int(consumed_total_clips * avg_train_clip_bytes)
-      reserve_bytes = max(0, active_train_bytes - consumed_total_bytes)
+      written_total_bytes = int(curation_state["train_committed_tar_bytes"])
+      produced_since_origin_bytes = max(0, written_total_bytes - reserve_origin_written_bytes)
+      reserve_bytes = _logical_reserve_bytes(
+        active_bytes=active_train_bytes,
+        origin_active_bytes=reserve_origin_active_bytes,
+        produced_since_origin_bytes=produced_since_origin_bytes,
+        consumed_since_origin_bytes=consumed_total_bytes,
+        pruned_since_origin_bytes=deleted_bytes_total,
+      )
 
       dt = max(1e-9, now - last_rate_t)
       if dt >= 1.0:
         consumed_delta = max(0, consumed_total_bytes - last_consumed_total_bytes)
-        written_total_bytes = int(curation_state["train_committed_tar_bytes"])
         written_delta = max(0, written_total_bytes - last_written_total_bytes)
         train_rate_inst = consumed_delta / dt
         write_rate_inst = written_delta / dt
@@ -1900,7 +1939,11 @@ def main() -> None:
       if args.prune_consumed and (now - last_prune_t) >= args.prune_every_sec and train_inventory:
         should_prune = bool(lake_blocked) or (reserve_bytes > reserve_high_bytes)
         if should_prune:
-          target_train_bytes = int(consumed_total_bytes + reserve_low_bytes)
+          target_train_bytes = _prune_target_bytes(
+            active_bytes=active_train_bytes,
+            reserve_bytes=reserve_bytes,
+            reserve_low_bytes=reserve_low_bytes,
+          )
           if args.lake_max_gb > 0 and lake_blocked:
             target_train_bytes = min(target_train_bytes, lake_resume_bytes)
           deleted_shards, deleted_bytes = _prune_old_shards(
@@ -1914,7 +1957,13 @@ def main() -> None:
             print(f"[lake] prune shards={deleted_shards} bytes_gb={deleted_bytes/GIB:.2f}", flush=True)
             train_inventory = _build_area_inventory(train_lake_dir)
             active_train_bytes = sum(rec[2] for rec in train_inventory)
-            reserve_bytes = max(0, active_train_bytes - consumed_total_bytes)
+            reserve_bytes = _logical_reserve_bytes(
+              active_bytes=active_train_bytes,
+              origin_active_bytes=reserve_origin_active_bytes,
+              produced_since_origin_bytes=produced_since_origin_bytes,
+              consumed_since_origin_bytes=consumed_total_bytes,
+              pruned_since_origin_bytes=deleted_bytes_total,
+            )
         last_prune_t = now
 
       blocked_now = bool(lake_blocked or hard_free_blocked)
@@ -1935,6 +1984,7 @@ def main() -> None:
           "[lake] "
           f"step={current_step} train_gb={active_train_bytes/GIB:.2f} "
           f"reserve_gb={reserve_bytes/GIB:.2f} consumed_gb~={consumed_total_bytes/GIB:.2f} "
+          f"produced_gb~={produced_since_origin_bytes/GIB:.2f} "
           f"train_rate~={train_rate_ema/GIB:.3f} GiB/s write_rate~={write_rate_ema/GIB:.3f} GiB/s "
           f"workers={len(_running_workers())}/{desired}/{args.num_streams} draining={len(draining_workers)} "
           f"val_entries={active_entries_val} decay_entries={active_entries_decay} "

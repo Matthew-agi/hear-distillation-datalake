@@ -2,6 +2,11 @@
 __pycache__/
 *.py[cod]
 *.so
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
 # Virtual environments
 .venv/
@@ -17,7 +22,6 @@ cache/
 checkpoints/
 wandb/
 results/
-docs/
 *.pt
 *.npy
 *.npz
