@@ -210,7 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("results/maeb-audio"))
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--smoke-samples", type=int, default=2)
@@ -221,8 +222,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if args.batch_size <= 0 or args.smoke_samples <= 0:
-        raise SystemExit("--batch-size and --smoke-samples must be positive.")
+    if args.batch_size <= 0 or args.smoke_samples <= 0 or args.num_workers < 0:
+        raise SystemExit("Batch/smoke sizes must be positive and workers must be non-negative.")
     try:
         import mteb
     except ImportError as exc:
@@ -248,6 +249,7 @@ def main(argv: list[str] | None = None) -> None:
         overwrite_strategy="only-missing",
         prediction_folder=args.output / "predictions",
         show_progress_bar=True,
+        num_proc=args.num_workers,
     )
     (args.output / "model-result.json").write_text(result.model_dump_json(indent=2) + "\n")
 
