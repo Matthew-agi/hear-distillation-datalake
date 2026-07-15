@@ -506,11 +506,17 @@ class ManifestClipDataset(IterableDataset):
 
 
 def _parse_args() -> argparse.Namespace:
-  ap = argparse.ArgumentParser(description="Distill HeAR into a ViT-S student.")
+  ap = argparse.ArgumentParser(description="Distill HeAR into a Canon-adapted ViT student.")
   ap.add_argument("--data-dir", type=Path, default=Path("data/laion_audio_2s"), help="Directory with shard-*.tar files.")
   ap.add_argument("--shards-glob", type=str, default="shard-*.tar", help="Glob pattern for shards.")
   ap.add_argument("--streams-glob", type=str, default="stream-*", help="Glob for stream subfolders inside data-dir.")
   ap.add_argument("--out", type=Path, default=Path("checkpoints/hear_vit_s"), help="Output/checkpoint directory.")
+  ap.add_argument(
+    "--model-size",
+    choices=["tiny", "small", "base", "large"],
+    default="small",
+    help="ViT family size. Canon widths and patch-grid adapters are inferred from the model.",
+  )
   ap.add_argument("--max-steps", type=int, default=20000, help="Number of training steps.")
   ap.add_argument("--batch-size", type=int, default=64, help="Batch size.")
   ap.add_argument("--grad-accum", type=int, default=1, help="Gradient accumulation steps.")
@@ -521,7 +527,12 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--lr-schedule-start-step", type=int, default=0, help="Global step at which LR scheduling begins (used for resumed phase-local decay).")
   ap.add_argument("--lr-warmup-steps", type=int, default=0, help="Linear warmup steps for LR.")
   ap.add_argument("--lr-min-ratio", type=float, default=0.1, help="Final LR ratio for cosine schedule.")
-  ap.add_argument("--auto-warmup", action="store_true", help="Enable automatic LR and batch warmup.")
+  ap.add_argument(
+    "--auto-warmup",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Enable automatic LR and batch warmup (default: enabled).",
+  )
   ap.add_argument("--auto-warmup-init-lr", type=float, default=0.0, help="Initial LR for auto warmup (<=0 uses 0.01 * --lr).")
   ap.add_argument("--auto-warmup-probe-batch-size", type=int, default=0, help="Initial probe batch size for auto warmup (<=0 uses max(8, batch_size//4)).")
   ap.add_argument("--auto-warmup-steps", type=int, default=1000, help="Number of warmup steps when --auto-warmup is enabled.")
@@ -544,8 +555,8 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument(
     "--batch-opt-mult",
     type=float,
-    default=1.0,
-    help="Multiplier applied to the selected CBS when choosing runtime batch size.",
+    default=2.0,
+    help="Post-warmup WSD multiplier applied to the selected critical batch (default: 2x).",
   )
   ap.add_argument(
     "--batch-opt-oom-buffer-frac",
@@ -730,6 +741,7 @@ def _disable_positional_embeddings(model: nn.Module) -> None:
 
 def _build_student(
   *,
+  model_size: str = "small",
   use_canon: bool,
   canon_2d: bool,
   canon_no_pos_enc: bool,
@@ -741,85 +753,31 @@ def _build_student(
   canon_d: bool,
   canon_causal: bool,
 ) -> nn.Module:
+  import sys
+
+  src_root = Path(__file__).resolve().parent / "src"
+  if str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+  from hear_distill.models import CanonConfig, build_audio_vit
+
   try:
-    import timm
+    return build_audio_vit(
+      model_size,
+      canon=CanonConfig(
+        enabled=use_canon,
+        use_2d=canon_2d,
+        disable_positional_encoding=canon_no_pos_enc,
+        kernel_size=canon_kernel,
+        a=canon_a,
+        b=canon_b,
+        b_qkv=canon_b_qkv,
+        c=canon_c,
+        d=canon_d,
+        causal=canon_causal,
+      ),
+    )
   except Exception as exc:  # noqa: BLE001
-    _die(f"timm is required for ViT-S student: {exc}")
-
-  # ViT-S backbone, 1-channel input, 192x128 spectrograms.
-  try:
-    model = timm.create_model(
-      "vit_small_patch16_224",
-      img_size=(192, 128),
-      in_chans=1,
-      num_classes=0,
-      global_pool="avg",
-    )
-  except Exception:
-    # Fallback: use default size; the caller can resize if needed.
-    model = timm.create_model(
-      "vit_small_patch16_224",
-      in_chans=1,
-      num_classes=0,
-      global_pool="avg",
-    )
-
-  if use_canon:
-    dim = getattr(model, "embed_dim", None) or getattr(model, "num_features", None)
-    if dim is None:
-      _die("Could not determine student embed_dim for Canon layers.")
-    if hasattr(model, "blocks"):
-      try:
-        grid_size = None
-        expect_cls = None
-        if canon_2d:
-          patch_embed = getattr(model, "patch_embed", None)
-          grid_size = getattr(patch_embed, "grid_size", None) if patch_embed is not None else None
-          if grid_size is None:
-            print("Warning: --canon-2d requested but model has no patch_embed.grid_size; falling back to 1D Canon.", flush=True)
-          num_prefix = getattr(model, "num_prefix_tokens", None)
-          if num_prefix is not None:
-            try:
-              num_prefix = int(num_prefix)
-            except Exception:
-              num_prefix = None
-            if num_prefix in (0, 1):
-              expect_cls = bool(num_prefix)
-            elif num_prefix is not None:
-              print(
-                f"Warning: Canon2D only supports 0/1 prefix tokens but model reports {num_prefix}; "
-                "falling back to 1D Canon.",
-                flush=True,
-              )
-          if expect_cls is None:
-            expect_cls = getattr(model, "cls_token", None) is not None
-        for i in range(len(model.blocks)):
-          model.blocks[i] = CanonBlockWrapper(
-            model.blocks[i],
-            int(dim),
-            kernel_size=canon_kernel,
-            canon_a=canon_a,
-            canon_b=canon_b,
-            canon_b_qkv=canon_b_qkv,
-            canon_c=canon_c,
-            canon_d=canon_d,
-            causal=canon_causal,
-            use_2d=canon_2d,
-            grid_size=grid_size,
-            expect_cls=expect_cls,
-          )
-      except Exception as exc:  # noqa: BLE001
-        _die(f"Failed to insert Canon layers: {exc}")
-    else:
-      _die("Student model has no `.blocks` attribute; cannot insert Canon layers.")
-
-  if canon_no_pos_enc:
-    if use_canon:
-      _disable_positional_embeddings(model)
-    else:
-      print("Warning: --canon-no-pos-enc set but Canon is disabled; ignoring.", flush=True)
-
-  return model
+    _die(f"Failed to build {model_size} ViT student: {exc}")
 
 
 def _student_features(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -2143,6 +2101,7 @@ def main() -> None:
   if (legacy_pre or legacy_post) and (args.canon_a or args.canon_b or args.canon_c or args.canon_d or args.canon_abcd):
     print("Warning: --canon-pre/--canon-post are deprecated and overridden by explicit A/B/C/D flags.", flush=True)
   student = _build_student(
+    model_size=str(args.model_size),
     use_canon=bool(use_canon),
     canon_2d=bool(getattr(args, "canon_2d", False)),
     canon_no_pos_enc=bool(getattr(args, "canon_no_pos_enc", False)),
@@ -3032,15 +2991,10 @@ def main() -> None:
             bootstrap_batch = min(bootstrap_batch, auto_warmup_gpu_batch_cap)
           if auto_warmup_max_batch_size is not None:
             bootstrap_batch = min(bootstrap_batch, auto_warmup_max_batch_size)
-        # Warmup batch bootstrap is growth-only; do not shrink below the probe
-        # batch unless an explicit OOM path forces us down later.
-        bootstrap_batch = max(int(current_train_batch), int(max(1, bootstrap_batch)))
         auto_warmup_last_batch_goal = float(bootstrap_batch)
-        current_train_batch = int(bootstrap_batch)
-        if current_train_batch != loader.batch_size:
-          _refresh_runtime_loaders("auto_warmup_bootstrap")
         print(
-          f"auto_warmup bootstrap_batch={current_train_batch} cbs~={bootstrap_opt_batch:.1f} "
+          f"auto_warmup measurement_batch={current_train_batch} "
+          f"post_warmup_batch_goal={bootstrap_batch} cbs~={bootstrap_opt_batch:.1f} "
           + (
             f" cbs_sel~={lr_gns_selected_opt_batch:.1f}"
             if lr_gns_selected_opt_batch is not None
@@ -3545,10 +3499,6 @@ def main() -> None:
                 batch_goal = min(batch_goal, int(auto_warmup_max_batch_size))
               batch_goal = max(1, batch_goal)
             auto_warmup_last_batch_goal = float(batch_goal)
-            if batch_goal > current_train_batch:
-              auto_warmup_last_safe_batch_size = int(current_train_batch)
-              current_train_batch = int(batch_goal)
-              _refresh_runtime_loaders("auto_warmup_gns")
         print(
           f"auto_warmup@step={step} crit_lr~="
           f"{(auto_warmup_last_crit_lr if auto_warmup_last_crit_lr is not None else float('nan')):.3e} "
@@ -3733,6 +3683,11 @@ def main() -> None:
 
     if auto_warmup_enabled and step == args.auto_warmup_steps:
       auto_warmup_handoff_lr = float(auto_warmup_current_lr)
+      handoff_batch_goal = _current_batch_goal_from_selected()
+      if handoff_batch_goal is not None and handoff_batch_goal != current_train_batch:
+        auto_warmup_last_safe_batch_size = int(current_train_batch)
+        current_train_batch = int(handoff_batch_goal)
+        _refresh_runtime_loaders("auto_warmup_handoff")
       auto_warmup_handoff_batch_size = int(current_train_batch)
       _enable_student_compile("post_warmup")
       print(

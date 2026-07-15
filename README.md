@@ -1,286 +1,285 @@
-# HeAR Audio Encoder Distillation Trainer
+# Canon Audio Encoder Trainer
 
-Train a compact audio encoder by distilling
-[`google/hear-pytorch`](https://huggingface.co/google/hear-pytorch) into a
-Canon-augmented ViT-S while LAION-Audio is streamed into a bounded local data
-lake. One launcher detects the host, chooses safe CPU/GPU settings, limits disk
-use, and supervises streaming, curation, training, pruning, validation, and
-checkpointing.
+Train Canon-adapted audio Vision Transformers from the same continuously
+streamed LAION-Audio source in either of two explicit modes:
 
-The normal path requires no configuration beyond Hugging Face authentication:
+- **direct pretraining** learns an encoder by reconstructing masked
+  mel-PCEN spectrogram patches with a lightweight, disposable decoder;
+- **distillation** learns from the gated Google HeAR teacher using embedding,
+  contrastive, and relational losses.
+
+Tiny, small, base, and large ViTs use one shared model factory. Canon widths,
+MLP widths, patch grids, decoder dimensions, and memory limits adapt to the
+selected model instead of assuming ViT-S.
+
+## Start on a GPU instance
 
 ```bash
 git clone https://github.com/Matthew-agi/hear-distillation-datalake.git
 cd hear-distillation-datalake
 ./scripts/bootstrap.sh
-.venv/bin/hf auth login
-./run.sh
+
+# Direct Canon-ViT pretraining; no HeAR teacher is downloaded.
+./run.sh --objective reconstruct --model-size base
 ```
 
-## What this repository provides
+For HeAR distillation, accept the
+[HeAR model terms](https://huggingface.co/google/hear-pytorch), authenticate,
+and select the other objective:
 
-- A continuously replenished, disk-bounded audio lake instead of a full
-  dataset download.
-- Hardware-aware defaults for disk, streaming processes, DataLoader workers,
-  GPU batch size, mixed precision, and teacher superbatching.
-- A HeAR teacher and Canon-augmented ViT-S student trained with embedding,
-  contrastive, and relational distillation losses.
-- Fast PCM16 streaming and decode paths plus cached, vectorized HeAR
-  mel-PCEN preprocessing.
-- Static-shape `torch.compile`, fused AdamW, CUDA mixed precision, and optional
-  teacher superbatching.
-- Optional critical-learning-rate and critical-batch-size warmup through the
-  standalone [`adaptive-warmup`](https://github.com/Matthew-agi/adaptive-warmup)
-  library.
-- Atomic state files, bounded validation/decay reservoirs, checkpoint pruning,
-  and guarded resume behavior.
+```bash
+.venv/bin/hf auth login
+./run.sh --objective distill --model-size small
+```
 
-## Requirements
+The backward-compatible default is `--objective distill --model-size small`.
 
-- Linux is recommended for a training instance. CUDA is optional for smoke
-  tests but expected for practical training.
-- Python 3.10 or newer. Bootstrap creates a Python 3.11 environment by default.
-- `git`, `curl`, and enough local storage for the selected lake budget.
-- Access to the gated HeAR model. Accept the
-  [model terms](https://huggingface.co/google/hear-pytorch) before logging in.
+## What is automatic
 
-On Debian/Ubuntu, bootstrap installs `ffmpeg` and `libsndfile1` when necessary.
-It also installs `uv`, creates `.venv`, chooses a compatible PyTorch backend,
-installs the project, and runs an environment check. No `.env` file or copied
-Hugging Face token is required.
+The launcher detects CPU count, GPU memory, filesystem capacity, and free
+space before it starts the lake. By default it budgets the smaller of:
 
-## Inspect before running
+```text
+50% of total filesystem capacity
+free space minus a 5–50 GiB safety floor
+```
 
-See the detected hardware and every resolved default without starting workers:
+It then sizes the rolling train lake, incoming chunks, stable validation and
+decay stores, stream processes, DataLoader workers, mixed precision, and the
+training-batch ceiling. There is no model-name multiplier table. The planner
+constructs the selected training graph on PyTorch's meta device and measures:
+
+- exact trainable parameter, gradient, and AdamW-state bytes;
+- batch-dependent saved-tensor bytes from the difference between batch-one and
+  batch-two autograd graphs;
+- the selected encoder, Canon layout, decoder, patch grid, and objective.
+
+On CUDA, direct pretraining then runs a real batch-one/batch-two allocation
+probe in the selected AMP mode. It subtracts memory already occupied by other
+GPU processes and keeps a configurable reserve. This live measurement can only
+lower the analytical ceiling.
+
+| ViT | Backbone | Default decoder |
+| --- | --- | --- |
+| tiny | `vit_tiny_patch16_224` | 192d, 2 layers |
+| small | `vit_small_patch16_224` | 256d, 2 layers |
+| base | `vit_base_patch16_224` | 384d, 3 layers |
+| large | `vit_large_patch16_224` | 512d, 4 layers |
+
+Adaptive warmup is enabled by default for both objectives. It starts from the
+smallest normal probe batch under the measured ceiling, estimates critical
+batch size and critical learning rate, and holds that measurement batch fixed
+for the entire warmup. At the WSD stable-phase handoff, the selected critical
+batch is multiplied by 2x by default, rounded, clamped to the measured ceiling,
+and applied once. `--auto-warmup-batch-multiplier` changes the direct trainer's
+multiple; distillation exposes the same policy as `--batch-opt-mult`. A real
+OOM is the safety exception: it lowers and persists the ceiling with headroom.
+
+Inspect everything without starting a worker:
 
 ```bash
 .venv/bin/hear-distill doctor
-.venv/bin/hear-distill defaults
-.venv/bin/hear-distill run --dry-run
+.venv/bin/hear-distill defaults --objective reconstruct --model-size large
+.venv/bin/hear-distill run --objective reconstruct --model-size large --dry-run
 ```
 
-`doctor` reports dependency, authentication, disk, and GPU status without
-printing credentials. `defaults` emits the complete runtime plan as JSON.
-`--dry-run` prints the final orchestrator command.
+## Direct pretraining design
 
-## Automatic resource sizing
+The audio waveform is converted to the same `[1, 192, 128]` HeAR mel-PCEN
+image used by distillation. Patch-16 models produce a `12 × 8` grid. By
+default, 75% of those embeddings are replaced in place with a learned mask
+token, and the complete grid passes through the Canon encoder.
 
-By default, the launcher uses at most **50% of the filesystem's total
-capacity**, further limited by currently free space and a safety floor. The
-budget includes the train lake, incoming chunks, validation and decay stores,
-checkpoints, and the Hugging Face cache.
+Keeping all 96 tokens is intentional. Canon2D reshapes tokens back into their
+time-frequency grid; dropping masked tokens as in a conventional MAE encoder
+would destroy that topology. A small Transformer decoder predicts only the
+masked patch targets. The decoder is a pretraining head and the encoder is the
+artifact used downstream.
 
-| Resource | Default policy |
-| --- | --- |
-| Disk budget | `min(50% of capacity, free space - safety floor)` |
-| Free-space floor | 5% of capacity, clamped to 5–50 GiB |
-| Train lake | 70% of the resolved disk budget |
-| Stream workers | Derived from CPU count, from 1 to 8 |
-| DataLoader workers | Remaining CPU capacity, capped at 12 |
-| Precision | BF16 on supported CUDA GPUs, otherwise FP16; FP32 on CPU |
-| Compilation | Static teacher, preprocessing, and student graphs |
-| Streaming | Scales workers according to lake production versus consumption |
-| Checkpoints | Every 1,000 steps, retaining the latest 20 numeric checkpoints |
-| LR schedule | `3e-4`, linear warmup, then cosine decay |
+New decoders are trained from scratch by default. Reusing an unrelated
+AudioMAE decoder is not safe: decoder weights depend on encoder width, patch
+geometry, positional layout, and decoder depth. `--decoder-checkpoint` is
+supported, but loading is strict and succeeds only when all of that metadata
+matches. See [the pretraining design note](docs/direct-pretraining.md).
 
-The initial training batch is selected from visible GPU memory:
-
-| GPU memory | Batch size |
-| ---: | ---: |
-| 75 GiB or more | 128 |
-| 39–74 GiB | 96 |
-| 23–38 GiB | 64 |
-| 15–22 GiB | 32 |
-| Less than 15 GiB | 16 |
-| CPU | 8 |
-
-GPUs with at least 39 GiB also begin with two student microbatches per teacher
-forward. The trainer automatically reduces that factor after an OOM.
-
-## How the pipeline works
+Every direct checkpoint contains separate keys:
 
 ```text
-LAION-Audio stream
-  -> partitioned download workers
-  -> ffmpeg extraction to 2-second PCM16 WAV clips
-  -> atomic incoming tar shards
-  -> train / validation / decay curation
-  -> HeAR teacher targets
-  -> Canon ViT-S student updates and checkpoints
+encoder       downstream Canon-ViT weights
+decoder       disposable reconstruction head
+model_config  exact compatibility metadata
+optim/scaler  continuation state
+args/step     reproducibility and progress
 ```
 
-The lake separates four kinds of state:
+You can initialize the encoder three ways when invoking the trainer directly:
+
+```bash
+# Default: encoder and decoder both start from random initialization.
+.venv/bin/hear-pretrain --data-dir data/laion_audio_lake/train --model-size base
+
+# timm ImageNet initialization for the encoder; decoder is still new.
+.venv/bin/hear-pretrain --data-dir data/laion_audio_lake/train \
+  --model-size base --encoder-pretrained
+
+# Strictly reuse an encoder or an architecture-compatible decoder.
+.venv/bin/hear-pretrain --data-dir data/laion_audio_lake/train \
+  --model-size base \
+  --encoder-checkpoint /path/to/checkpoint.pt \
+  --decoder-checkpoint /path/to/checkpoint.pt
+```
+
+## Distillation design
+
+Distillation freezes `google/hear-pytorch` and trains the selected Canon-ViT
+plus a 512-dimensional projection using:
+
+```text
+MSE(student, teacher)
++ bidirectional student/teacher InfoNCE
++ relational similarity-matrix MSE
+```
+
+CUDA runs use mixed precision, fused AdamW when available, `torch.compile`, and
+optional teacher superbatching. Critical-learning-rate and critical-batch-size
+warmup is enabled by default through the standalone
+[`adaptive-warmup`](https://github.com/Matthew-agi/adaptive-warmup) library.
+The generated defaults include the architecture-derived batch ceiling. A
+manual trainer block is still supported:
+
+```bash
+TRAIN_ARGS="--device cuda --amp --repeat --shuffle-shards \
+--model-size small --canon --canon-2d --canon-abcd --canon-no-pos-enc \
+--max-steps 200000 --lr 3e-4 --lr-schedule cosine \
+--auto-warmup --auto-warmup-steps 1000 --gns-every 0"
+
+./run.sh --objective distill --train-extra-args "$TRAIN_ARGS"
+```
+
+The warmup policy and probes live only in `adaptive-warmup`, pinned in
+`pyproject.toml`. Bootstrap uses a sibling `../adaptive-warmup` checkout as an
+editable override when one is present.
+
+## One data source, two trainers
+
+```text
+LAION-Audio streaming dataset
+  -> partitioned download and ffmpeg extraction
+  -> atomic 2-second PCM16 tar shards
+  -> bounded train / validation / decay curation
+  -> direct masked reconstruction OR HeAR distillation
+  -> encoder checkpoints
+```
+
+The lake layout is shared:
 
 ```text
 data/laion_audio_lake/
   incoming/     completed worker shards awaiting curation
   train/        bounded rolling training lake
   val/          stable hash-sampled validation reservoir
-  decay/        bounded sample for the final decay phase
-  manifests/    atomic curation and active-set metadata
-  cache/        Hugging Face cache governed by the same disk budget
+  decay/        bounded final-phase sample
+  manifests/    atomic active-set and curation state
+  cache/        Hugging Face cache inside the same disk budget
 ```
 
-Only completed `.tar` files are exposed to curation and training. Optional
-workers finish chunks before retiring, and consumed train shards are pruned
-without crossing the configured reserve floor.
+Only completed tar files reach the trainers. New shards are discovered while
+training, and old consumed shards are pruned without crossing the reserve
+floor.
 
-## Common overrides
-
-Unspecified values remain automatic:
+## Common controls
 
 ```bash
 # Use 35% rather than 50% of the filesystem.
-./run.sh --disk-fraction 0.35
+./run.sh --objective reconstruct --disk-fraction 0.35
 
-# Change the run length and output locations.
-./run.sh \
-  --max-steps 300000 \
-  --data-dir /mnt/local/hear-data \
-  --train-out /mnt/local/checkpoints
+# Put the lake and checkpoints on instance storage.
+./run.sh --objective reconstruct --model-size large \
+  --data-dir /mnt/local/audio-lake \
+  --train-out /mnt/local/checkpoints/canon-vit-large
 
-# Override selected orchestrator decisions.
-./run.sh --num-streams 4 --train-batch-size 96
+# Override individual orchestrator decisions.
+./run.sh --objective distill --num-streams 4 --train-batch-size 64
 ```
 
-Unknown `hear-distill run` arguments are passed to `datalake/run_lake.py`.
-Consult [`datalake/README.md`](datalake/README.md) for direct orchestration
-controls.
+Unknown `hear-distill run` arguments pass through to the lake orchestrator.
+When `--train-extra-args` is supplied, it replaces the default trainer block;
+include the model size, Canon flags, schedule, and repeat flags you need.
 
-### Advanced trainer configuration
-
-`--train-extra-args` replaces the launcher's default trainer argument block; it
-does not append to it. Include the desired model, schedule, repeat, and runtime
-flags explicitly:
+Useful help surfaces:
 
 ```bash
-TRAIN_ARGS="--device cuda --amp --repeat --shuffle-shards \
---canon --canon-2d --canon-abcd --canon-no-pos-enc \
---max-steps 200000 --lr 3e-4 --lr-schedule cosine \
---lr-warmup-steps 500 --gns-every 0"
-
-./run.sh --train-extra-args "$TRAIN_ARGS"
-```
-
-The full trainer interface is available with:
-
-```bash
+.venv/bin/hear-distill run --help
+.venv/bin/hear-pretrain --help
 .venv/bin/python distill_hear_vit_s_canon2d.py --help
+.venv/bin/python datalake/run_lake.py --help
 ```
 
-## Adaptive learning-rate and batch warmup
+## Resume and outputs
 
-The optional adaptive warmup measures two quantities during early training:
-
-1. A forward-only directional search estimates the critical learning rate
-   along the upcoming optimizer update. It usually needs six held-out student
-   forwards and is capped at nine by default. Frozen teacher targets and audio
-   preprocessing are computed only once per probe batch.
-2. Two independent minibatch gradients estimate gradient noise and the
-   critical batch size.
-
-Critical sharpness is reported using
-`critical_sharpness = 2 / critical_learning_rate`. The controller applies a
-default 0.8 safety factor, smooths noisy measurements, and ramps toward the
-selected LR and batch size.
-
-Enable it by replacing linear warmup with `--auto-warmup`:
-
-```bash
-TRAIN_ARGS="--device cuda --amp --repeat --shuffle-shards \
---canon --canon-2d --canon-abcd --canon-no-pos-enc \
---max-steps 200000 --lr 3e-4 --lr-schedule cosine \
---auto-warmup --auto-warmup-steps 1000 --gns-every 0"
-
-./run.sh --train-extra-args "$TRAIN_ARGS"
-```
-
-The algorithm and optimizer-direction implementation live only in
-`adaptive-warmup`, pinned from GitHub in `pyproject.toml`. To test a standalone
-branch or commit without changing the pin:
-
-```bash
-ADAPTIVE_WARMUP_SOURCE="git+https://github.com/Matthew-agi/adaptive-warmup.git@main" \
-  ./scripts/bootstrap.sh
-```
-
-When `../adaptive-warmup` exists, bootstrap uses that sibling checkout as an
-editable development override.
-
-## Resume behavior
-
-Streamer offsets, curation state, and manifests are persisted atomically and
-reused when the same data directory is started again. Training checkpoint
-resume is explicit. Add one of these flags to a complete advanced trainer
-configuration:
+Streamer offsets, lake curation state, and manifests are atomic and reusable.
+Training continuation is explicit:
 
 ```text
 --resume-latest
 --resume-from /absolute/path/to/ckpt_12000.pt
 ```
 
-Optimizer state is required by default so a resumed run preserves AdamW
-moments and the adaptive-warmup update direction. The orchestrator rejects
-step regressions and incompatible resume state rather than silently restarting
-from an earlier point.
+Both trainers restore model, optimizer, scaler, and step. Direct pretraining
+also rejects a resume whose model, patch grid, or decoder metadata differs.
+The orchestrator rejects step regressions rather than silently restarting.
 
-## Monitoring and outputs
-
-The launcher continuously reports stream production, training consumption,
-reserve size, worker count, pruning, training loss, LR, batch size, and
-throughput. Checkpoints default to:
-
-```text
-checkpoints/hear_vit_s_lake/
-  ckpt_1000.pt
-  ckpt_2000.pt
-  ...
-  ckpt_final.pt
-  decay_phase/
-```
-
-For detailed stage timings, run the trainer with
-`--optimizer-mode diagnostic`. Optional Weights & Biases logging is available
-through `--wandb`, `--wandb-project`, `--wandb-entity`, and
-`--wandb-run-name` in the advanced trainer arguments.
-
-## Evaluation and benchmarking
+Evaluate either a distilled or direct-pretraining encoder with the same tool:
 
 ```bash
-# Evaluate a distilled checkpoint.
-uv run python evaluate_distilled_hear.py \
+.venv/bin/python evaluate_distilled_hear.py \
   --embedding-model distilled \
-  --ckpt checkpoints/hear_vit_s_lake/ckpt_final.pt \
+  --embedding-head student \
+  --ckpt checkpoints/canon_audio_pretrain/ckpt_final.pt \
   --device cuda
-
-# Compare student and HeAR teacher throughput.
-uv run python benchmark_student_vs_hear.py \
-  --ckpt checkpoints/hear_vit_s_lake/ckpt_final.pt \
-  --device cuda
-
-# Microbenchmark decode and preprocessing.
-uv run python benchmarks/benchmark_audio_pipeline.py --batch-size 16
 ```
 
-## Repository map
+The benchmark accepts either the historical `student` checkpoint key or the
+direct trainer's `encoder` key:
 
-| Path | Purpose |
-| --- | --- |
-| `run.sh` | Bootstrap-if-needed and launch the automatic pipeline |
-| `scripts/bootstrap.sh` | Host dependencies, Python environment, and runtime check |
-| `src/hear_distill/autotune.py` | Pure hardware-to-runtime planning policy |
-| `src/hear_distill/cli.py` | `run`, `defaults`, and `doctor` commands |
-| `src/hear_distill/audio.py` | Fast audio decode and HeAR preprocessing |
-| `datalake/run_lake.py` | Streaming, curation, training, pruning, and resume supervisor |
-| `stream_laion_audio_clips.py` | Partitioned LAION-Audio extraction and shard writing |
-| `distill_hear_vit_s_canon2d.py` | Teacher/student training and checkpointing |
-| `evaluate_distilled_hear.py` | Downstream embedding evaluation |
-| `benchmark_student_vs_hear.py` | Student-versus-teacher throughput comparison |
-| `tests/` | Unit and integration coverage |
+```bash
+.venv/bin/python benchmark_student_vs_hear.py \
+  --ckpt checkpoints/canon_audio_pretrain/ckpt_final.pt \
+  --device cuda
+```
 
-See [`docs/architecture.md`](docs/architecture.md) and
-[`docs/performance.md`](docs/performance.md) for implementation boundaries and
-performance rationale.
+## Repository layout
+
+```text
+src/hear_distill/
+  audio.py                 shared decode and mel-PCEN preprocessing
+  autotune.py              disk, worker, precision, and batch policy
+  cli.py                   one-command objective selection
+  data/shards.py           reusable live tar-shard dataset
+  models/canon.py          single Canon implementation
+  models/memory.py         graph-derived memory measurement
+  models/vit.py            tiny/small/base/large factory
+  models/reconstruction.py masked reconstruction encoder/decoder
+  training/pretrain.py     direct-pretraining loop and checkpoints
+
+scripts/
+  bootstrap.sh             GPU-instance environment setup
+  train/distill.py          organized distillation entrypoint
+  train/pretrain_reconstruction.py
+                            direct-pretraining entrypoint
+
+datalake/run_lake.py       streaming and bounded-lake supervisor
+distill_hear_vit_s_canon2d.py
+                            legacy-compatible distillation entrypoint
+evaluate_distilled_hear.py downstream embedding evaluation
+benchmark_student_vs_hear.py
+                            encoder-versus-HeAR throughput benchmark
+```
+
+The root research entrypoints remain for checkpoint and command compatibility;
+new reusable code belongs under `src/hear_distill/`. Architecture and
+performance boundaries are documented in [docs/architecture.md](docs/architecture.md)
+and [docs/performance.md](docs/performance.md).
 
 ## Development
 
@@ -290,44 +289,26 @@ performance rationale.
 .venv/bin/python -m ruff check src tests benchmarks
 ```
 
-The test suite includes host-planning policy, fast audio paths, critical-LR
-integration, streamer resume, lake control, and an end-to-end fake
-streamer/trainer orchestration test.
-
 ## Troubleshooting
 
-**HeAR download is unauthorized**
+**HeAR download is unauthorized** — accept the model terms and run
+`.venv/bin/hf auth login`. Direct reconstruction does not download HeAR.
 
-Accept the model terms in the browser, then rerun `.venv/bin/hf auth login`.
-Use `.venv/bin/hear-distill doctor` to confirm the credential is visible.
+**CUDA is unavailable** — check `nvidia-smi`, then rerun bootstrap after fixing
+driver or container passthrough. `hear-distill defaults` shows what was found.
 
-**CUDA is not detected**
+**CUDA runs out of memory** — adaptive warmup catches a real training OOM,
+backs off with headroom, and checkpoints the lower ceiling. Use
+`--train-batch-size` only when you want to impose a stricter manual cap.
 
-Run `nvidia-smi`, then inspect `.venv/bin/hear-distill defaults`. Bootstrap
-selects PyTorch from the driver visible at installation time; rerun bootstrap
-after fixing the host driver or container GPU passthrough.
+**Training waits for data** — compare production and consumption in the lake
+status line. Increase stream workers only when production is the bottleneck.
 
-**CUDA runs out of memory**
+**Disk approaches the host limit** — lower `--disk-fraction`. The controller
+also stops at its free-space floor, but cannot govern unrelated processes.
 
-Lower `--train-batch-size`, set a smaller teacher batch factor, or cap adaptive
-warmup with `--auto-warmup-max-batch-size`. Teacher superbatching and adaptive
-batch growth both back off after OOM signals.
-
-**Training waits for data**
-
-Inspect the production/consumption rates in the lake status line. Increase
-`--num-streams` only when streaming throughput is below training consumption;
-otherwise increase DataLoader workers only when diagnostic loader-wait time is
-material.
-
-**Disk use approaches the host limit**
-
-Lower `--disk-fraction`. The controller pauses new chunks at the lake cap and
-free-space floor, but unrelated processes can still consume space outside its
-budget.
-
-## License and third-party code
+## License
 
 This repository is released under the [MIT License](LICENSE). The bundled HeAR
 audio preprocessing adaptation retains its upstream Apache 2.0 notice; see
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -404,6 +404,7 @@ def main() -> None:
 
   use_canon, canon_a, canon_b, canon_c, canon_d = _resolve_canon_flags_from_dict(ckpt_args)
   student = _build_student(
+    model_size=str(ckpt_args.get("model_size", "small")),
     use_canon=bool(use_canon),
     canon_2d=bool(ckpt_args.get("canon_2d", False)),
     canon_no_pos_enc=bool(ckpt_args.get("canon_no_pos_enc", False)),
@@ -415,7 +416,10 @@ def main() -> None:
     canon_d=bool(canon_d),
     canon_causal=bool(ckpt_args.get("canon_causal", False)),
   ).to(device)
-  student.load_state_dict(ckpt["student"], strict=True)
+  student_state = ckpt.get("student") or ckpt.get("encoder")
+  if not isinstance(student_state, dict):
+    _die("Checkpoint has neither `student` nor `encoder` weights.")
+  student.load_state_dict(student_state, strict=True)
   student.eval()
 
   print(

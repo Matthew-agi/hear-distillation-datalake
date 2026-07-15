@@ -410,6 +410,7 @@ def _resolve_canon_flags_from_dict(d: dict) -> Tuple[bool, bool, bool, bool, boo
 
 def _build_student(
   *,
+  model_size: str = "small",
   use_canon: bool,
   canon_2d: bool,
   canon_no_pos_enc: bool,
@@ -421,81 +422,31 @@ def _build_student(
   canon_d: bool,
   canon_causal: bool,
 ) -> nn.Module:
+  import sys
+
+  src_root = Path(__file__).resolve().parent / "src"
+  if str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+  from hear_distill.models import CanonConfig, build_audio_vit
+
   try:
-    import timm
+    return build_audio_vit(
+      model_size,
+      canon=CanonConfig(
+        enabled=use_canon,
+        use_2d=canon_2d,
+        disable_positional_encoding=canon_no_pos_enc,
+        kernel_size=canon_kernel,
+        a=canon_a,
+        b=canon_b,
+        b_qkv=canon_b_qkv,
+        c=canon_c,
+        d=canon_d,
+        causal=canon_causal,
+      ),
+    )
   except Exception as exc:  # noqa: BLE001
-    _die(f"timm is required for ViT-S student: {exc}")
-
-  try:
-    model = timm.create_model(
-      "vit_small_patch16_224",
-      img_size=(192, 128),
-      in_chans=1,
-      num_classes=0,
-      global_pool="avg",
-    )
-  except Exception:
-    model = timm.create_model(
-      "vit_small_patch16_224",
-      in_chans=1,
-      num_classes=0,
-      global_pool="avg",
-    )
-
-  if use_canon:
-    dim = getattr(model, "embed_dim", None) or getattr(model, "num_features", None)
-    if dim is None:
-      _die("Could not determine student embed_dim for Canon layers.")
-    if hasattr(model, "blocks"):
-      try:
-        grid_size = None
-        expect_cls = None
-        if canon_2d:
-          patch_embed = getattr(model, "patch_embed", None)
-          grid_size = getattr(patch_embed, "grid_size", None) if patch_embed is not None else None
-          if grid_size is None:
-            print("Warning: --canon-2d requested but model has no patch_embed.grid_size; falling back to 1D Canon.", flush=True)
-          num_prefix = getattr(model, "num_prefix_tokens", None)
-          if num_prefix is not None:
-            try:
-              num_prefix = int(num_prefix)
-            except Exception:
-              num_prefix = None
-            if num_prefix in (0, 1):
-              expect_cls = bool(num_prefix)
-            elif num_prefix is not None:
-              print(
-                f"Warning: Canon2D only supports 0/1 prefix tokens but model reports {num_prefix}; "
-                "falling back to 1D Canon.",
-                flush=True,
-              )
-          if expect_cls is None:
-            expect_cls = getattr(model, "cls_token", None) is not None
-        for i in range(len(model.blocks)):
-          model.blocks[i] = CanonBlockWrapper(
-            model.blocks[i],
-            int(dim),
-            kernel_size=canon_kernel,
-            canon_a=canon_a,
-            canon_b=canon_b,
-            canon_b_qkv=canon_b_qkv,
-            canon_c=canon_c,
-            canon_d=canon_d,
-            causal=canon_causal,
-            use_2d=canon_2d,
-            grid_size=grid_size,
-            expect_cls=expect_cls,
-          )
-      except Exception as exc:  # noqa: BLE001
-        _die(f"Failed to insert Canon layers: {exc}")
-    else:
-      _die("Student model has no `.blocks` attribute; cannot insert Canon layers.")
-  if canon_no_pos_enc:
-    if use_canon:
-      _disable_positional_embeddings(model)
-    else:
-      print("Warning: --canon-no-pos-enc set but Canon is disabled; ignoring.", flush=True)
-  return model
+    _die(f"Failed to build {model_size} ViT student: {exc}")
 
 
 def _load_ckpt(path: Path, *, allow_unsafe: bool) -> dict:
@@ -567,8 +518,11 @@ def _load_student_and_proj(
   embedding_head: str,
 ) -> Tuple[nn.Module, nn.Module, dict, int]:
   ckpt = _load_ckpt(ckpt_path, allow_unsafe=allow_unsafe)
-  if "student" not in ckpt:
-    _die("Checkpoint missing required key: 'student'.")
+  state_key = "student" if "student" in ckpt else "encoder" if "encoder" in ckpt else None
+  if state_key is None:
+    _die("Checkpoint missing encoder weights (`student` or `encoder`).")
+  student_state = ckpt[state_key]
+  direct_pretraining = state_key == "encoder"
   ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
   use_canon, canon_a, canon_b, canon_c, canon_d = _resolve_canon_flags_from_dict(ckpt_args)
   canon_kernel = int(ckpt_args.get("canon_kernel", 4))
@@ -577,7 +531,7 @@ def _load_student_and_proj(
   canon_no_pos_enc = bool(ckpt_args.get("canon_no_pos_enc", False))
   canon_b_qkv = bool(ckpt_args.get("canon_b_qkv", False))
 
-  inferred = _infer_canon_layout_from_state(ckpt["student"])
+  inferred = _infer_canon_layout_from_state(student_state)
   if inferred.get("use_canon", False):
     use_canon = True
     canon_a = bool(inferred.get("canon_a", canon_a))
@@ -590,6 +544,7 @@ def _load_student_and_proj(
       canon_2d = bool(inferred_2d)
 
   student = _build_student(
+    model_size=str(ckpt_args.get("model_size", "small")),
     use_canon=use_canon,
     canon_2d=canon_2d,
     canon_no_pos_enc=canon_no_pos_enc,
@@ -601,7 +556,7 @@ def _load_student_and_proj(
     canon_d=canon_d,
     canon_causal=canon_causal,
   ).to(device)
-  student.load_state_dict(ckpt["student"], strict=True)
+  student.load_state_dict(student_state, strict=True)
   student.eval()
 
   proj_state = ckpt.get("proj")
@@ -609,7 +564,15 @@ def _load_student_and_proj(
 
   if embedding_head == "proj":
     if proj_state is None or "weight" not in proj_state:
-      _die("Projection head requested but checkpoint projection state is missing.")
+      if direct_pretraining:
+        print(
+          "Direct-pretraining checkpoint has no projection head; using raw encoder features.",
+          flush=True,
+        )
+        embedding_head = "student"
+      else:
+        _die("Projection head requested but checkpoint projection state is missing.")
+  if embedding_head == "proj":
     out_features, in_features = proj_state["weight"].shape
     proj = nn.Linear(in_features, out_features).to(device)
     proj.load_state_dict(proj_state, strict=True)

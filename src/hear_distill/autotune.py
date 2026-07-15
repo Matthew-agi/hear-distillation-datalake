@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
+from .models.memory import estimate_training_memory, round_batch_cap
+
 
 GIB = 1024**3
 
@@ -88,24 +90,24 @@ def inspect_host(path: Path) -> HostResources:
     )
 
 
-def _batch_size_for_gpu(memory_gib: float) -> int:
-    if memory_gib >= 75:
-        return 128
-    if memory_gib >= 39:
-        return 96
-    if memory_gib >= 23:
-        return 64
-    if memory_gib >= 15:
-        return 32
-    if memory_gib > 0:
-        return 16
-    return 8
+def training_batch_size(
+    memory_gib: float,
+    *,
+    model_size: str = "small",
+    objective: str = "distill",
+) -> int:
+    """Derive a hardware ceiling from the selected model's autograd graph."""
+
+    estimate = estimate_training_memory(model_size, objective)
+    return round_batch_cap(estimate.maximum_batch_size(memory_gib), round_to=8)
 
 
 def build_runtime_plan(
     resources: HostResources,
     *,
     disk_fraction: float = 0.5,
+    model_size: str = "small",
+    objective: str = "distill",
 ) -> RuntimePlan:
     if not 0.05 <= disk_fraction <= 0.9:
         raise ValueError("disk_fraction must be between 0.05 and 0.9.")
@@ -133,7 +135,9 @@ def build_runtime_plan(
 
     device = "cuda" if resources.gpu_name else "cpu"
     amp = device == "cuda"
-    teacher_batch_factor = 2 if resources.gpu_memory_gib >= 39 else 1
+    teacher_batch_factor = (
+        2 if objective == "distill" and resources.gpu_memory_gib >= 39 else 1
+    )
 
     return RuntimePlan(
         disk_fraction=float(disk_fraction),
@@ -148,7 +152,11 @@ def build_runtime_plan(
         num_streams=num_streams,
         min_streams=min_streams,
         train_num_workers=train_workers,
-        train_batch_size=_batch_size_for_gpu(resources.gpu_memory_gib),
+        train_batch_size=training_batch_size(
+            resources.gpu_memory_gib,
+            model_size=model_size,
+            objective=objective,
+        ),
         shuffle_buffer=shuffle_buffer,
         shard_size=2_000,
         device=device,
@@ -162,4 +170,5 @@ __all__ = [
     "RuntimePlan",
     "build_runtime_plan",
     "inspect_host",
+    "training_batch_size",
 ]

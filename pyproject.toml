@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hear-distillation-datalake"
-version = "0.2.0"
-description = "Hardware-aware streaming distillation pipeline for Google HeAR"
+version = "0.3.0"
+description = "Hardware-aware audio distillation and direct Canon-ViT pretraining"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
-  "adaptive-warmup @ git+https://github.com/Matthew-agi/adaptive-warmup.git@v0.2.0",
+  "adaptive-warmup @ git+https://github.com/Matthew-agi/adaptive-warmup.git@a009641c7705bbe2ba2a42d97d1a3a9febb2d89b",
   "datasets>=3.0",
   "hf-transfer>=0.1.9",
   "huggingface-hub>=0.29",
@@ -32,6 +32,7 @@ dev = [
 
 [project.scripts]
 hear-distill = "hear_distill.cli:main"
+hear-pretrain = "hear_distill.training.pretrain:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
