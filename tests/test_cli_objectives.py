@@ -25,6 +25,7 @@ def test_reconstruction_dry_run_selects_new_trainer_and_model(
     assert result == 0
     assert "objective=reconstruct model=large" in output
     assert "scripts/train/pretrain_reconstruction.py" in output
+    assert "--python" in output
     assert "--model-size large" in output
     assert "--auto-warmup" in output
     assert "--auto-warmup-max-batch-size" in output

@@ -146,6 +146,7 @@ def _run(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
         else Path("checkpoints/canon_audio_pretrain")
     )
     _append_default(command, passthrough, "--repo-root", repo_root)
+    _append_default(command, passthrough, "--python", sys.executable)
     _append_default(command, passthrough, "--data-dir", args.data_dir)
     _append_default(command, passthrough, "--train-out", train_out)
     _append_default(command, passthrough, "--train-script", train_script)
