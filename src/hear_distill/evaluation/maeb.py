@@ -17,6 +17,12 @@ from tqdm.auto import tqdm
 from hear_distill.audio import AudioPreprocessor
 from hear_distill.models import CanonConfig, build_audio_vit, pooled_features
 
+try:
+    from mteb.models.abs_encoder import AbsEncoder
+except ImportError:  # Keep core training installs independent of the benchmark extra.
+    class AbsEncoder:  # type: ignore[no-redef]
+        pass
+
 
 BENCHMARK_NAME = "MAEB(audio-only)"
 SAMPLE_RATE = 16_000
@@ -72,7 +78,7 @@ def load_encoder_checkpoint(path: Path, device: torch.device) -> tuple[nn.Module
     return encoder, checkpoint
 
 
-class CanonAudioMTEBEncoder:
+class CanonAudioMTEBEncoder(AbsEncoder):
     """MTEB encoder protocol adapter for the trained Canon audio ViT."""
 
     def __init__(
