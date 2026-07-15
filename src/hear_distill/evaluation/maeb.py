@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -150,7 +151,10 @@ def _find_audio_examples(task: Any, limit: int) -> list[dict[str, Any]]:
     def visit(value: Any) -> None:
         if len(examples) >= limit or value is None:
             return
-        if isinstance(value, dict):
+        if hasattr(value, "get_all_samples"):
+            examples.append(value)
+            return
+        if isinstance(value, Mapping):
             if "array" in value and "sampling_rate" in value:
                 examples.append(value)
                 return
