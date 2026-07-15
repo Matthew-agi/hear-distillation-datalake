@@ -90,6 +90,7 @@ class CanonAudioMTEBEncoder(AbsEncoder):
     ) -> None:
         try:
             from mteb.models import ModelMeta
+            from mteb.models.model_meta import ScoringFunction
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError("Install the benchmark dependencies with `pip install -e '.[benchmark]'`.") from exc
 
@@ -106,7 +107,7 @@ class CanonAudioMTEBEncoder(AbsEncoder):
                 "revision": f"step-{raw_checkpoint.get('step', 'unknown')}",
                 "n_parameters": parameters,
                 "embed_dim": dim,
-                "similarity_fn_name": "cosine",
+                "similarity_fn_name": ScoringFunction.COSINE,
                 "framework": ["PyTorch", "timm"],
                 "modalities": ["audio"],
                 "model_type": ["dense"],
@@ -216,7 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("results/maeb-audio"))
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=16)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp-dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
