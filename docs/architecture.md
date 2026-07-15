@@ -58,7 +58,8 @@ choice preserves the spatial contract required by Canon2D.
 Both trainers default to adaptive warmup. The model graph supplies a memory
 ceiling, the direct trainer calibrates it with live CUDA allocations, and the
 standalone adaptive-warmup controller selects critical batch and LR within that
-ceiling. The loader batch remains fixed while those measurements are collected;
+ceiling. Direct training starts at the largest power-of-two batch within that
+ceiling, and the loader batch remains fixed while measurements are collected;
 the default 2x WSD batch multiple is rounded up to a power of two and applied
 once at the transition to stable training. OOM feedback is the only warmup-time
 batch change, moves the ceiling downward, and is checkpointed.

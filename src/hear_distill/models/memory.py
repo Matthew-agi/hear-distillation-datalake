@@ -118,11 +118,11 @@ def estimate_training_memory(
 
 
 def rounded_initial_batch(maximum_batch_size: int, *, round_to: int = 8) -> int:
-    """Choose the controller's smallest normal probe batch under the cap."""
+    """Choose the largest power-of-two warmup batch under the measured cap."""
 
     if maximum_batch_size <= 0 or round_to <= 0:
         raise ValueError("maximum_batch_size and round_to must be positive.")
-    return min(int(maximum_batch_size), int(round_to))
+    return 1 << int(math.floor(math.log2(maximum_batch_size)))
 
 
 def round_batch_cap(maximum_batch_size: int, *, round_to: int = 8) -> int:

@@ -66,8 +66,8 @@ lower the analytical ceiling.
 | base | `vit_base_patch16_224` | 384d, 3 layers |
 | large | `vit_large_patch16_224` | 512d, 4 layers |
 
-Adaptive warmup is enabled by default for both objectives. It starts from the
-smallest normal probe batch under the measured ceiling, estimates critical
+Adaptive warmup is enabled by default for both objectives. Direct training
+starts from the largest power-of-two batch under the measured GPU ceiling, estimates critical
 batch size and critical learning rate, and holds that measurement batch fixed
 for the entire warmup. At the WSD stable-phase handoff, the selected critical
 batch is multiplied by 2x by default, rounded up to the next power of two,

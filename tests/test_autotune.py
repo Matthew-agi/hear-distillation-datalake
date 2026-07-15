@@ -1,5 +1,5 @@
 from hear_distill.autotune import HostResources, build_runtime_plan, training_batch_size
-from hear_distill.models.memory import estimate_training_memory
+from hear_distill.models.memory import estimate_training_memory, rounded_initial_batch
 
 
 def test_plan_uses_at_most_half_of_disk_and_preserves_free_space() -> None:
@@ -66,3 +66,9 @@ def test_batch_plan_scales_with_model_and_objective() -> None:
         assert 0 < plan.train_batch_size <= raw_cap
         assert plan.train_batch_size % 8 == 0
     assert base_reconstruct.teacher_batch_factor == 1
+
+
+def test_adaptive_warmup_starts_at_largest_supported_power_of_two() -> None:
+    assert rounded_initial_batch(224) == 128
+    assert rounded_initial_batch(128) == 128
+    assert rounded_initial_batch(7) == 4
