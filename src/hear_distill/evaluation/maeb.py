@@ -147,6 +147,11 @@ def _find_audio_examples(task: Any, limit: int) -> list[dict[str, Any]]:
     """Find representative decoded audio values in any MTEB task storage layout."""
     examples: list[dict[str, Any]] = []
     roots = [getattr(task, name, None) for name in ("dataset", "queries", "corpus")]
+    declared_columns = {
+        getattr(task, name, None)
+        for name in ("input_column_name", "input1_column_name", "input2_column_name")
+    }
+    declared_columns.discard(None)
 
     def visit(value: Any) -> None:
         if len(examples) >= limit or value is None:
@@ -164,7 +169,11 @@ def _find_audio_examples(task: Any, limit: int) -> list[dict[str, Any]]:
                     return
             return
         if hasattr(value, "column_names") and hasattr(value, "__len__"):
-            audio_columns = [name for name in value.column_names if name.startswith("audio")]
+            audio_columns = [
+                name
+                for name in value.column_names
+                if name in declared_columns or name.startswith("audio")
+            ]
             for index in range(min(len(value), limit)):
                 row = value[index]
                 for name in audio_columns:
