@@ -49,6 +49,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from adaptive_warmup import CriticalLREstimate, estimate_critical_learning_rate
+from hear_distill.models.memory import rounded_initial_batch
 
 
 def _die(msg: str) -> "None":
@@ -2290,7 +2291,17 @@ def main() -> None:
 
   auto_warmup_enabled = bool(args.auto_warmup)
   auto_warmup_init_lr = float(args.auto_warmup_init_lr) if args.auto_warmup_init_lr > 0 else max(float(args.lr) * 0.01, 1e-8)
-  auto_warmup_probe_batch_size = int(args.auto_warmup_probe_batch_size) if args.auto_warmup_probe_batch_size > 0 else max(8, int(args.batch_size) // 4)
+  default_probe_cap = min(
+    int(args.batch_size),
+    int(args.auto_warmup_max_batch_size)
+    if args.auto_warmup_max_batch_size > 0
+    else int(args.batch_size),
+  )
+  auto_warmup_probe_batch_size = (
+    int(args.auto_warmup_probe_batch_size)
+    if args.auto_warmup_probe_batch_size > 0
+    else rounded_initial_batch(default_probe_cap)
+  )
   auto_warmup_probe_batch_size = max(1, auto_warmup_probe_batch_size)
   auto_warmup_max_lr = float(args.auto_warmup_max_lr) if args.auto_warmup_max_lr > 0 else None
   auto_warmup_max_batch_size = int(args.auto_warmup_max_batch_size) if args.auto_warmup_max_batch_size > 0 else None

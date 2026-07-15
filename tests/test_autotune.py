@@ -1,4 +1,5 @@
 from hear_distill.autotune import HostResources, build_runtime_plan, training_batch_size
+from hear_distill.cli import _train_defaults
 from hear_distill.models.memory import estimate_training_memory, rounded_initial_batch
 
 
@@ -72,3 +73,14 @@ def test_adaptive_warmup_starts_at_largest_supported_power_of_two() -> None:
     assert rounded_initial_batch(224) == 128
     assert rounded_initial_batch(128) == 128
     assert rounded_initial_batch(7) == 4
+    distill_defaults = _train_defaults(
+        objective="distill",
+        model_size="small",
+        device="cuda",
+        amp=True,
+        teacher_batch_factor=1,
+        batch_cap=224,
+        max_steps=10_000,
+    )
+    probe_index = distill_defaults.index("--auto-warmup-probe-batch-size")
+    assert distill_defaults[probe_index + 1] == "128"

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .autotune import build_runtime_plan, inspect_host
+from .models.memory import rounded_initial_batch
 
 
 def _repo_root() -> Path:
@@ -96,7 +97,9 @@ def _train_defaults(
     warmup_steps = min(1000, max(1, max_steps // 10))
     tokens.extend(("--auto-warmup-steps", str(warmup_steps)))
     if objective == "distill":
-        tokens.extend(("--auto-warmup-probe-batch-size", str(min(8, batch_cap))))
+        tokens.extend(
+            ("--auto-warmup-probe-batch-size", str(rounded_initial_batch(batch_cap)))
+        )
     if amp:
         tokens.append("--amp")
     if objective == "distill" and teacher_batch_factor > 1:
