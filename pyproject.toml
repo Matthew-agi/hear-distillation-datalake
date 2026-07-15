@@ -25,6 +25,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+benchmark = [
+  "mteb[audio]==2.18.3",
+]
 dev = [
   "pytest>=8.2",
   "ruff>=0.9",
@@ -32,6 +35,7 @@ dev = [
 
 [project.scripts]
 hear-distill = "hear_distill.cli:main"
+hear-maeb = "hear_distill.evaluation.maeb:main"
 hear-pretrain = "hear_distill.training.pretrain:main"
 
 [tool.setuptools.packages.find]
