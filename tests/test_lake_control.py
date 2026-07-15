@@ -2,8 +2,11 @@ import json
 import tarfile
 from pathlib import Path
 
+import torch
+
 from datalake.run_lake import (
     _claimed_bytes_from_inventory,
+    _checkpoint_trainer_defaults,
     _load_curation_state,
 )
 
@@ -29,6 +32,28 @@ def test_fresh_consumption_is_monotonic_across_inventory_refreshes() -> None:
         )
         == 50
     )
+
+
+def test_decay_resume_preserves_completed_warmup_configuration(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    torch.save(
+        {
+            "args": {
+                "batch_size": 224,
+                "grad_accum": 1,
+                "num_workers": 10,
+                "lr": 3.0e-4,
+            },
+            "adaptive_warmup_state": {"config": {"max_lr": 3.0e-4}},
+        },
+        checkpoint,
+    )
+
+    defaults = _checkpoint_trainer_defaults(checkpoint)
+
+    assert defaults["batch_size"] == 224
+    assert defaults["original_lr"] == 3.0e-4
+    assert defaults["auto_warmup_max_lr"] == 3.0e-4
 
 
 def test_legacy_copied_decay_store_is_discarded(tmp_path: Path) -> None:

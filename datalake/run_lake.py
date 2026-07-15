@@ -361,8 +361,8 @@ def _checkpoint_optimizer_lr(path: Path) -> Optional[float]:
   return None
 
 
-def _checkpoint_trainer_defaults(path: Path) -> Dict[str, int]:
-  defaults: Dict[str, int] = {}
+def _checkpoint_trainer_defaults(path: Path) -> Dict[str, float | int]:
+  defaults: Dict[str, float | int] = {}
   try:
     import torch
 
@@ -388,6 +388,22 @@ def _checkpoint_trainer_defaults(path: Path) -> Dict[str, int]:
           continue
         if value > 0:
           defaults[dst_key] = value
+      try:
+        original_lr = float(arg_state.get("lr", 0.0))
+      except (TypeError, ValueError):
+        original_lr = 0.0
+      if math.isfinite(original_lr) and original_lr > 0.0:
+        defaults["original_lr"] = original_lr
+    adaptive_warmup_state = ckpt.get("adaptive_warmup_state")
+    if isinstance(adaptive_warmup_state, dict):
+      config = adaptive_warmup_state.get("config")
+      if isinstance(config, dict):
+        try:
+          max_lr = float(config.get("max_lr", 0.0))
+        except (TypeError, ValueError):
+          max_lr = 0.0
+        if math.isfinite(max_lr) and max_lr > 0.0:
+          defaults["auto_warmup_max_lr"] = max_lr
     auto_warmup_state = ckpt.get("auto_warmup_state")
     if isinstance(auto_warmup_state, dict):
       for key in ("handoff_batch_size", "current_batch_size"):
@@ -1818,6 +1834,12 @@ def main() -> None:
             print("[lake] decay disabled after resolving decay length; exiting after stable phase", flush=True)
             raise SystemExit(0)
           decay_total_max_steps = max(0, stable_final_step) + resolved_decay_steps
+          resume_warmup_max_lr = float(
+            stable_runtime_defaults.get(
+              "auto_warmup_max_lr",
+              stable_runtime_defaults.get("original_lr", stable_final_lr),
+            )
+          )
           decay_managed_tokens = [
             "--lr",
             f"{stable_final_lr:.12g}",
@@ -1825,6 +1847,8 @@ def main() -> None:
             "linear",
             "--lr-schedule-start-step",
             str(int(stable_final_step)),
+            "--auto-warmup-max-lr",
+            f"{resume_warmup_max_lr:.12g}",
           ]
           decay_cmd = _build_train_cmd(
             data_dir=decay_lake_dir,
