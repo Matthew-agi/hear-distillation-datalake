@@ -57,22 +57,19 @@ def _disk_free_gb(path: Path) -> float:
   return usage.free / GIB
 
 
-def _logical_reserve_bytes(
-  *,
-  active_bytes: int,
-  origin_active_bytes: int,
-  produced_since_origin_bytes: int,
-  consumed_since_origin_bytes: int,
-  pruned_since_origin_bytes: int = 0,
-) -> int:
-  logical = max(
-    0,
-    int(origin_active_bytes)
-    + int(produced_since_origin_bytes)
-    - int(consumed_since_origin_bytes)
-    - int(pruned_since_origin_bytes),
-  )
-  return min(max(0, int(active_bytes)), logical)
+def _raw_stage_stats(stage_dir: Path) -> Tuple[int, int]:
+  ready = 0
+  total_bytes = 0
+  for path in stage_dir.rglob("source-*.tar*"):
+    if not path.is_file():
+      continue
+    if path.suffix == ".tar" and path.parent.name != "inflight":
+      ready += 1
+    try:
+      total_bytes += int(path.stat().st_size)
+    except OSError:
+      continue
+  return ready, total_bytes
 
 
 def _claimed_bytes_from_inventory(
@@ -92,11 +89,6 @@ def _claimed_bytes_from_inventory(
     - int(pruned_since_origin_bytes),
   )
   return max(int(previous_claimed_bytes), claimed)
-
-
-def _prune_target_bytes(*, active_bytes: int, reserve_bytes: int, reserve_low_bytes: int) -> int:
-  surplus = max(0, int(reserve_bytes) - int(reserve_low_bytes))
-  return max(int(reserve_low_bytes), int(active_bytes) - surplus)
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -210,47 +202,6 @@ def _build_area_inventory(data_dir: Path) -> List[Tuple[Path, str, int, int, int
     records.append((p, key, int(st.st_size), int(st.st_mtime_ns), sidx, shidx))
   records.sort(key=lambda r: (r[3], r[4], r[5], r[1]))
   return records
-
-
-def _prune_old_shards(
-  records: List[Tuple[Path, str, int, int, int, int]],
-  *,
-  target_total_bytes: int,
-  keep_recent_shards_per_stream: int,
-  max_delete_shards: int,
-) -> Tuple[int, int]:
-  if not records or max_delete_shards <= 0:
-    return 0, 0
-
-  keep_keys: Set[str] = set()
-  if keep_recent_shards_per_stream > 0:
-    by_stream: Dict[int, List[Tuple[Path, str, int, int, int, int]]] = {}
-    for rec in records:
-      by_stream.setdefault(rec[4], []).append(rec)
-    for items in by_stream.values():
-      for rec in items[-keep_recent_shards_per_stream:]:
-        keep_keys.add(rec[1])
-
-  current_total_bytes = sum(rec[2] for rec in records)
-  deleted_shards = 0
-  deleted_bytes = 0
-  for path, key, nbytes, _mtime_ns, _sidx, _shidx in records:
-    if deleted_shards >= max_delete_shards:
-      break
-    if key in keep_keys:
-      continue
-    if current_total_bytes <= target_total_bytes:
-      break
-    try:
-      path.unlink()
-    except FileNotFoundError:
-      continue
-    except OSError:
-      continue
-    current_total_bytes = max(0, current_total_bytes - nbytes)
-    deleted_shards += 1
-    deleted_bytes += nbytes
-  return deleted_shards, deleted_bytes
 
 
 def _stream_dirs(data_dir: Path) -> List[Tuple[int, Path]]:
@@ -957,15 +908,6 @@ def _parse_args() -> argparse.Namespace:
     help="Resume scheduling new chunks when train lake drops below this fraction of --lake-max-gb.",
   )
   ap.add_argument("--inventory-refresh-sec", type=float, default=10.0, help="Seconds between curated train inventory refreshes.")
-  ap.add_argument(
-    "--prune-consumed",
-    action=argparse.BooleanOptionalAction,
-    default=True,
-    help="Delete old curated train shards while respecting the reserve floor.",
-  )
-  ap.add_argument("--prune-every-sec", type=float, default=15.0, help="Seconds between prune checks.")
-  ap.add_argument("--prune-max-shards", type=int, default=16, help="Max train shards deleted per prune cycle.")
-  ap.add_argument("--prune-keep-recent-shards", type=int, default=1, help="Keep this many latest train shards per stream.")
   ap.add_argument("--retire-workers-at-chunk-boundary", action=argparse.BooleanOptionalAction, default=True, help="Let optional workers finish their current chunk before retirement.")
   ap.add_argument("--status-every-sec", type=float, default=20.0)
   ap.add_argument("--poll-sec", type=float, default=1.0)
@@ -996,12 +938,6 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--train-out", type=Path, default=Path("checkpoints/hear_vit_s_lake"))
   ap.add_argument("--shard-refresh-sec", type=float, default=20.0)
   ap.add_argument("--train-extra-args", type=str, default="")
-  ap.add_argument(
-    "--fresh-data",
-    action=argparse.BooleanOptionalAction,
-    default=False,
-    help="Treat curated train shards as a consumable at-most-once queue.",
-  )
   ap.add_argument("--decay-steps", type=int, default=-1, help="Decay phase steps: 0 disables, >0 uses an explicit length, <0 uses --decay-fraction of completed stable training.")
   ap.add_argument("--decay-fraction", type=float, default=0.10, help="Default decay length as a fraction of completed stable training when --decay-steps < 0.")
   ap.add_argument("--decay-out", type=Path, default=None, help="Decay phase output dir (default: <train-out>/decay_phase).")
@@ -1037,12 +973,6 @@ def main() -> None:
     _die("--lake-resume-fraction must be in (0, 1]")
   if args.inventory_refresh_sec <= 0:
     _die("--inventory-refresh-sec must be > 0")
-  if args.prune_every_sec <= 0:
-    _die("--prune-every-sec must be > 0")
-  if args.prune_max_shards <= 0:
-    _die("--prune-max-shards must be > 0")
-  if args.prune_keep_recent_shards < 0:
-    _die("--prune-keep-recent-shards must be >= 0")
   if args.status_every_sec <= 0 or args.poll_sec <= 0:
     _die("--status-every-sec and --poll-sec must be > 0")
   if args.max_stream_failures <= 0:
@@ -1088,6 +1018,7 @@ def main() -> None:
     if args.incoming_dir is not None and not args.incoming_dir.is_absolute()
     else (args.incoming_dir.resolve() if args.incoming_dir is not None else (data_root / "incoming").resolve())
   )
+  staging_dir = data_root / "staging"
   train_lake_dir = (
     (repo_root / args.train_lake_dir).resolve()
     if args.train_lake_dir is not None and not args.train_lake_dir.is_absolute()
@@ -1141,7 +1072,16 @@ def main() -> None:
   if not stream_script.exists():
     _die(f"Streaming script not found: {stream_script}")
 
-  mkdir_paths = [data_root, incoming_dir, train_lake_dir, val_lake_dir, decay_lake_dir, manifests_dir, train_out]
+  mkdir_paths = [
+    data_root,
+    staging_dir,
+    incoming_dir,
+    train_lake_dir,
+    val_lake_dir,
+    decay_lake_dir,
+    manifests_dir,
+    train_out,
+  ]
   if args.decay_steps != 0:
     mkdir_paths.append(decay_out)
   for path in mkdir_paths:
@@ -1159,10 +1099,13 @@ def main() -> None:
       source="--train-extra-args",
       flags=("--data-dir", "--out", "--val-manifest"),
     )
-  if args.fresh_data and (
-    "--repeat" in train_extra_tokens or "--no-consume-shards" in train_extra_tokens
-  ):
-    _die("--fresh-data cannot be combined with trainer shard reuse.")
+  replay_flags = {"--repeat", "--consume-shards", "--no-consume-shards"}
+  unsupported_replay_flags = sorted(replay_flags.intersection(train_extra_tokens))
+  if unsupported_replay_flags:
+    _die(
+      "Training data is always at-most-once; remove obsolete flag(s): "
+      + ", ".join(unsupported_replay_flags)
+    )
   decay_extra_tokens: List[str] = []
   if args.decay_extra_args:
     try:
@@ -1286,8 +1229,6 @@ def main() -> None:
     ]
     if live_refresh:
       cmd.extend(["--live-shard-refresh", "--shard-refresh-sec", str(args.shard_refresh_sec)])
-    if args.fresh_data:
-      cmd.extend(["--consume-shards", "--no-repeat"])
     if resume_from is not None:
       cmd.extend(["--resume-from", str(resume_from)])
     if max_steps_override is not None:
@@ -1332,17 +1273,10 @@ def main() -> None:
   write_rate_ema = 0.0
   per_worker_write_rate_ema = 0.0
   last_rate_t = time.time()
-  avg_train_clip_bytes = float(
-    curation_state["train_committed_member_bytes"] / max(1, curation_state["train_committed_clips"])
-    if curation_state["train_committed_clips"] > 0
-    else estimated_clip_bytes
-  )
   last_consumed_total_bytes = 0
   last_written_total_bytes = int(curation_state["train_committed_tar_bytes"])
-  deleted_bytes_total = 0
   train_inventory: List[Tuple[Path, str, int, int, int, int]] = []
   last_inventory_t = 0.0
-  last_prune_t = 0.0
   lake_blocked = False
   training_phase = "stable"
 
@@ -1427,6 +1361,8 @@ def main() -> None:
       str(stream_script),
       "--out",
       str(incoming_dir),
+      "--raw-stage-dir",
+      str(staging_dir),
       "--num-clips",
       "0",
       "--target-bytes",
@@ -1809,7 +1745,6 @@ def main() -> None:
   train_inventory = _build_area_inventory(train_lake_dir)
   reserve_origin_active_bytes = sum(rec[2] for rec in train_inventory)
   reserve_origin_written_bytes = int(curation_state["train_committed_tar_bytes"])
-  reserve_origin_step = int(current_step)
   last_written_total_bytes = reserve_origin_written_bytes
 
   train_proc = _start_training("stable", stable_train_cmd)
@@ -1920,32 +1855,16 @@ def main() -> None:
         last_inventory_t = now
 
       active_train_bytes = sum(rec[2] for rec in train_inventory)
-      avg_train_clip_bytes = (
-        float(curation_state["train_committed_member_bytes"]) / max(1, int(curation_state["train_committed_clips"]))
-        if int(curation_state["train_committed_clips"]) > 0
-        else float(estimated_clip_bytes)
-      )
       written_total_bytes = int(curation_state["train_committed_tar_bytes"])
       produced_since_origin_bytes = max(0, written_total_bytes - reserve_origin_written_bytes)
-      if args.fresh_data:
-        consumed_total_bytes = _claimed_bytes_from_inventory(
-          origin_active_bytes=reserve_origin_active_bytes,
-          produced_since_origin_bytes=produced_since_origin_bytes,
-          active_bytes=active_train_bytes,
-          pruned_since_origin_bytes=deleted_bytes_total,
-          previous_claimed_bytes=last_consumed_total_bytes,
-        )
-        reserve_bytes = active_train_bytes
-      else:
-        consumed_total_clips = max(0, current_step - reserve_origin_step) * args.train_batch_size * args.train_grad_accum
-        consumed_total_bytes = int(consumed_total_clips * avg_train_clip_bytes)
-        reserve_bytes = _logical_reserve_bytes(
-          active_bytes=active_train_bytes,
-          origin_active_bytes=reserve_origin_active_bytes,
-          produced_since_origin_bytes=produced_since_origin_bytes,
-          consumed_since_origin_bytes=consumed_total_bytes,
-          pruned_since_origin_bytes=deleted_bytes_total,
-        )
+      consumed_total_bytes = _claimed_bytes_from_inventory(
+        origin_active_bytes=reserve_origin_active_bytes,
+        produced_since_origin_bytes=produced_since_origin_bytes,
+        active_bytes=active_train_bytes,
+        pruned_since_origin_bytes=0,
+        previous_claimed_bytes=last_consumed_total_bytes,
+      )
+      reserve_bytes = active_train_bytes
 
       dt = max(1e-9, now - last_rate_t)
       if dt >= 1.0:
@@ -1977,41 +1896,6 @@ def main() -> None:
             flush=True,
           )
 
-      if (
-        args.prune_consumed
-        and not args.fresh_data
-        and (now - last_prune_t) >= args.prune_every_sec
-        and train_inventory
-      ):
-        should_prune = bool(lake_blocked) or (reserve_bytes > reserve_high_bytes)
-        if should_prune:
-          target_train_bytes = _prune_target_bytes(
-            active_bytes=active_train_bytes,
-            reserve_bytes=reserve_bytes,
-            reserve_low_bytes=reserve_low_bytes,
-          )
-          if args.lake_max_gb > 0 and lake_blocked:
-            target_train_bytes = min(target_train_bytes, lake_resume_bytes)
-          deleted_shards, deleted_bytes = _prune_old_shards(
-            train_inventory,
-            target_total_bytes=max(0, target_train_bytes),
-            keep_recent_shards_per_stream=args.prune_keep_recent_shards,
-            max_delete_shards=args.prune_max_shards,
-          )
-          if deleted_shards > 0:
-            deleted_bytes_total += deleted_bytes
-            print(f"[lake] prune shards={deleted_shards} bytes_gb={deleted_bytes/GIB:.2f}", flush=True)
-            train_inventory = _build_area_inventory(train_lake_dir)
-            active_train_bytes = sum(rec[2] for rec in train_inventory)
-            reserve_bytes = _logical_reserve_bytes(
-              active_bytes=active_train_bytes,
-              origin_active_bytes=reserve_origin_active_bytes,
-              produced_since_origin_bytes=produced_since_origin_bytes,
-              consumed_since_origin_bytes=consumed_total_bytes,
-              pruned_since_origin_bytes=deleted_bytes_total,
-            )
-        last_prune_t = now
-
       blocked_now = bool(lake_blocked or hard_free_blocked)
       desired = _desired_workers(
         reserve_bytes=reserve_bytes,
@@ -2026,6 +1910,7 @@ def main() -> None:
       if (now - last_status_t) >= args.status_every_sec:
         active_entries_val = len(curation_state["val_active"])
         active_entries_decay = len(curation_state["decay_active"])
+        raw_ready, raw_stage_bytes = _raw_stage_stats(staging_dir)
         print(
           "[lake] "
           f"step={current_step} train_gb={active_train_bytes/GIB:.2f} "
@@ -2033,6 +1918,7 @@ def main() -> None:
           f"produced_gb~={produced_since_origin_bytes/GIB:.2f} "
           f"train_rate~={train_rate_ema/GIB:.3f} GiB/s write_rate~={write_rate_ema/GIB:.3f} GiB/s "
           f"workers={len(_running_workers())}/{desired}/{args.num_streams} draining={len(draining_workers)} "
+          f"raw_ready={raw_ready} raw_stage_gb={raw_stage_bytes/GIB:.2f} "
           f"val_entries={active_entries_val} decay_entries={active_entries_decay} "
           f"free_gb={free_gb:.1f} blocked={int(blocked_now)}",
           flush=True,

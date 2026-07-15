@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """
 Distill Google HeAR (teacher) into a ViT-S student using locally saved clips.
 
@@ -29,8 +27,11 @@ Example:
     --device cuda
 """
 
+from __future__ import annotations
+
 import argparse
 from collections import deque
+import contextlib
 import io
 import json
 import math
@@ -39,7 +40,6 @@ import random
 import re
 import tarfile
 import time
-import contextlib
 from pathlib import Path
 from typing import Deque, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -49,6 +49,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from adaptive_warmup import CriticalLREstimate, estimate_critical_learning_rate
+from hear_distill.data import AudioShardDataset, discard_claimed_shards
 from hear_distill.models.memory import rounded_initial_batch
 
 
@@ -643,7 +644,12 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--clip-seconds", type=float, default=2.0, help="Clip length in seconds.")
   ap.add_argument("--sample-rate", type=int, default=16000, help="Sample rate.")
   ap.add_argument("--shuffle-shards", action="store_true", help="Shuffle shard order per epoch.")
-  ap.add_argument("--repeat", action="store_true", help="Repeat over shards indefinitely (recommended).")
+  ap.add_argument(
+    "--claim-dir",
+    type=Path,
+    default=None,
+    help="At-most-once shard claim directory (default: a sibling of --data-dir).",
+  )
   ap.add_argument("--live-shard-refresh", action="store_true", help="Refresh shard list while training to ingest newly written shards.")
   ap.add_argument("--shard-refresh-sec", type=float, default=30.0, help="Seconds between shard list refreshes when --live-shard-refresh is enabled.")
   ap.add_argument(
@@ -1771,9 +1777,11 @@ def _next_batch(
 ) -> Tuple[torch.Tensor, Iterator[torch.Tensor]]:
   try:
     batch = next(data_iter)
-  except StopIteration:
-    data_iter = iter(loader)
-    batch = next(data_iter)
+  except StopIteration as exc:
+    raise RuntimeError(
+      "Fresh training data is exhausted. Add new shards or run with "
+      "--live-shard-refresh to wait for the staged pipeline."
+    ) from exc
   return batch, data_iter
 
 
@@ -2056,8 +2064,17 @@ def main() -> None:
 
   data_dir = args.data_dir
   shards = _discover_shards(data_dir, args.shards_glob, args.streams_glob)
-  if not shards:
+  if not shards and not args.live_shard_refresh:
     _die(f"No shards found in {data_dir} matching {args.shards_glob}")
+  claim_dir = args.claim_dir or data_dir.parent / "inflight_train"
+  if claim_dir.resolve() == data_dir.resolve():
+    _die("--claim-dir must be separate from --data-dir.")
+  discarded_claims = discard_claimed_shards(claim_dir)
+  if discarded_claims:
+    print(
+      f"Discarded {discarded_claims} stale claimed shards; they will not be replayed.",
+      flush=True,
+    )
   orchestrated_val_manifest = args.val_manifest.resolve() if args.val_manifest is not None else None
   val_enabled = bool(args.val_fraction > 0.0 or args.val_target_clips > 0 or orchestrated_val_manifest is not None)
   if len(shards) < 2 and val_enabled and orchestrated_val_manifest is None:
@@ -2607,20 +2624,22 @@ def main() -> None:
     print(f"Warning: failed to write val shard file {val_shards_file}: {exc}", flush=True)
 
   clip_samples = int(round(args.clip_seconds * args.sample_rate))
-  def _build_train_loader(excluded_shards: List[Path], batch_size: int) -> Tuple[ClipDataset, DataLoader]:
+  def _build_train_loader(
+    excluded_shards: List[Path], batch_size: int
+  ) -> Tuple[AudioShardDataset, DataLoader]:
     train_source = shard_list if args.live_shard_refresh else [s for s in shard_list if s not in set(excluded_shards)]
-    ds = ClipDataset(
+    ds = AudioShardDataset(
       train_source,
       clip_samples=clip_samples,
       sample_rate=args.sample_rate,
       shuffle_shards=args.shuffle_shards,
       seed=args.seed,
-      repeat=args.repeat,
       live_data_dir=(data_dir if args.live_shard_refresh else None),
       shards_glob=args.shards_glob,
       streams_glob=args.streams_glob,
       refresh_interval_sec=args.shard_refresh_sec,
       exclude_shards=excluded_shards,
+      claim_dir=claim_dir,
     )
     ld = _make_data_loader(
       ds,

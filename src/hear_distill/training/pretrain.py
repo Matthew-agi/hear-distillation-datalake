@@ -125,13 +125,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-checkpoints", type=int, default=5)
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--resume-latest", action="store_true")
-    parser.add_argument("--repeat", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument(
-        "--consume-shards",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Atomically claim every train shard once and delete it after reading.",
-    )
     parser.add_argument("--claim-dir", type=Path)
     parser.add_argument("--shuffle-shards", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--live-shard-refresh", action="store_true")
@@ -291,8 +284,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--auto-warmup-oom-buffer-frac must be in [0, 1).")
     if args.resume_from is not None and args.resume_latest:
         raise SystemExit("Use only one of --resume-from and --resume-latest.")
-    if args.consume_shards and args.repeat:
-        raise SystemExit("--consume-shards cannot be combined with --repeat.")
 
 
 def _make_loader(
@@ -387,31 +378,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.backends.cudnn.benchmark = True
 
     shards = discover_shards(args.data_dir, args.shards_glob, args.streams_glob)
-    if not shards and not (args.consume_shards and args.live_shard_refresh):
+    if not shards and not args.live_shard_refresh:
         raise SystemExit(f"No audio shards found under {args.data_dir}.")
     claim_dir = args.claim_dir or args.data_dir.parent / "inflight_train"
-    if args.consume_shards:
-        if claim_dir.resolve() == args.data_dir.resolve():
-            raise SystemExit("--claim-dir must be separate from --data-dir.")
-        discarded_claims = discard_claimed_shards(claim_dir)
-        if discarded_claims:
-            print(
-                f"Discarded {discarded_claims} stale claimed shards; they will not be replayed.",
-                flush=True,
-            )
+    if claim_dir.resolve() == args.data_dir.resolve():
+        raise SystemExit("--claim-dir must be separate from --data-dir.")
+    discarded_claims = discard_claimed_shards(claim_dir)
+    if discarded_claims:
+        print(
+            f"Discarded {discarded_claims} stale claimed shards; they will not be replayed.",
+            flush=True,
+        )
     dataset = AudioShardDataset(
         shards,
         clip_samples=32_000,
         sample_rate=16_000,
         shuffle_shards=args.shuffle_shards,
         seed=args.seed,
-        repeat=args.repeat,
         live_data_dir=args.data_dir if args.live_shard_refresh else None,
         shards_glob=args.shards_glob,
         streams_glob=args.streams_glob,
         refresh_interval_sec=args.shard_refresh_sec,
-        consume_shards=args.consume_shards,
-        claim_dir=claim_dir if args.consume_shards else None,
+        claim_dir=claim_dir,
     )
     encoder = build_audio_vit(
         args.model_size,
@@ -646,12 +634,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     data_iterator = iter(loader)
 
     def next_audio_batch() -> torch.Tensor:
-        nonlocal data_iterator
         try:
             batch = next(data_iterator)
-        except StopIteration:
-            data_iterator = iter(loader)
-            batch = next(data_iterator)
+        except StopIteration as error:
+            raise RuntimeError(
+                "Fresh training data is exhausted. Add new shards or run with "
+                "--live-shard-refresh to wait for the staged pipeline."
+            ) from error
         return batch.to(device, non_blocking=True)
 
     def preprocess_audio(audio: torch.Tensor) -> torch.Tensor:

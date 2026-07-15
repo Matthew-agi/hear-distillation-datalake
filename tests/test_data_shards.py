@@ -35,8 +35,6 @@ def test_consumable_dataset_claims_each_shard_once(tmp_path: Path) -> None:
     dataset = AudioShardDataset(
         [shard],
         shuffle_shards=False,
-        repeat=False,
-        consume_shards=True,
         claim_dir=claim_dir,
     )
 
@@ -53,3 +51,23 @@ def test_stale_claims_are_discarded_instead_of_replayed(tmp_path: Path) -> None:
 
     assert discard_claimed_shards(claim_dir) == 1
     assert list(claim_dir.iterdir()) == []
+
+
+def test_excluded_validation_shard_is_never_claimed(tmp_path: Path) -> None:
+    train_dir = tmp_path / "train"
+    claim_dir = tmp_path / "inflight"
+    train_dir.mkdir()
+    train_shard = train_dir / "shard-000000.tar"
+    validation_shard = train_dir / "shard-000001.tar"
+    _write_audio_shard(train_shard)
+    _write_audio_shard(validation_shard)
+    dataset = AudioShardDataset(
+        [train_shard, validation_shard],
+        shuffle_shards=False,
+        claim_dir=claim_dir,
+        exclude_shards=[validation_shard],
+    )
+
+    assert len(list(dataset)) == 1
+    assert not train_shard.exists()
+    assert validation_shard.exists()

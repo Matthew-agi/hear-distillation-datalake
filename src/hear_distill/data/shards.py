@@ -91,7 +91,7 @@ def _claim_shard(shard: Path, claim_dir: Path, worker_id: int) -> Path | None:
 
 
 class AudioShardDataset(IterableDataset):
-    """Fixed-length clips with live discovery of newly curated shards."""
+    """At-most-once fixed-length clips with optional live shard discovery."""
 
     def __init__(
         self,
@@ -101,13 +101,12 @@ class AudioShardDataset(IterableDataset):
         sample_rate: int = 16_000,
         shuffle_shards: bool = True,
         seed: int = 1337,
-        repeat: bool = True,
         live_data_dir: Path | None = None,
         shards_glob: str = "shard-*.tar",
         streams_glob: str = "stream-*",
         refresh_interval_sec: float = 30.0,
-        consume_shards: bool = False,
         claim_dir: Path | None = None,
+        exclude_shards: list[Path] | None = None,
     ) -> None:
         super().__init__()
         self.shards = list(shards)
@@ -115,47 +114,56 @@ class AudioShardDataset(IterableDataset):
         self.sample_rate = int(sample_rate)
         self.shuffle_shards = bool(shuffle_shards)
         self.seed = int(seed)
-        self.repeat = bool(repeat)
         self.live_data_dir = live_data_dir
         self.shards_glob = shards_glob
         self.streams_glob = streams_glob
         self.refresh_interval_sec = max(1.0, float(refresh_interval_sec))
-        self.consume_shards = bool(consume_shards)
         self.claim_dir = claim_dir
+        self.exclude_shards = {
+            str(path.resolve()) for path in (exclude_shards or [])
+        }
         self._last_refresh = 0.0
-        if self.consume_shards and self.claim_dir is None:
-            raise ValueError("claim_dir is required when consume_shards is enabled.")
+        if self.claim_dir is None:
+            raise ValueError("claim_dir is required for at-most-once training data.")
 
     def _current_shards(self) -> list[Path]:
-        if self.live_data_dir is None:
+        if self.live_data_dir is not None:
+            now = time.time()
+            if now - self._last_refresh >= self.refresh_interval_sec:
+                fresh = discover_shards(
+                    self.live_data_dir, self.shards_glob, self.streams_glob
+                )
+                if fresh:
+                    self.shards = fresh
+                self._last_refresh = now
+        if not self.exclude_shards:
             return self.shards
-        now = time.time()
-        if now - self._last_refresh >= self.refresh_interval_sec:
-            fresh = discover_shards(
-                self.live_data_dir, self.shards_glob, self.streams_glob
-            )
-            if fresh:
-                self.shards = fresh
-            self._last_refresh = now
-        return self.shards
+        return [
+            shard
+            for shard in self.shards
+            if str(shard.resolve()) not in self.exclude_shards
+        ]
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         worker = get_worker_info()
         worker_id = worker.id if worker is not None else 0
-        worker_count = worker.num_workers if worker is not None else 1
         rng = random.Random(self.seed + worker_id)
 
         while True:
-            if self.consume_shards and self.live_data_dir is not None:
+            if self.live_data_dir is not None:
                 shards = discover_shards(
                     self.live_data_dir, self.shards_glob, self.streams_glob
                 )
+                if self.exclude_shards:
+                    shards = [
+                        shard
+                        for shard in shards
+                        if str(shard.resolve()) not in self.exclude_shards
+                    ]
             else:
                 shards = self._current_shards()
-            if not self.consume_shards:
-                shards = shards[worker_id::worker_count]
             if not shards:
-                if not self.repeat and self.live_data_dir is None:
+                if self.live_data_dir is None:
                     return
                 time.sleep(min(2.0, self.refresh_interval_sec))
                 continue
@@ -163,15 +171,12 @@ class AudioShardDataset(IterableDataset):
             if self.shuffle_shards:
                 rng.shuffle(order)
             for shard in order:
-                claimed = None
-                if self.consume_shards:
-                    assert self.claim_dir is not None
-                    claimed = _claim_shard(shard, self.claim_dir, worker_id)
-                    if claimed is None:
-                        continue
-                    shard = claimed
+                assert self.claim_dir is not None
+                claimed = _claim_shard(shard, self.claim_dir, worker_id)
+                if claimed is None:
+                    continue
                 try:
-                    for wav_bytes, _metadata in iter_tar_pairs(shard):
+                    for wav_bytes, _metadata in iter_tar_pairs(claimed):
                         audio = decode_wav_bytes(wav_bytes, self.sample_rate)
                         if audio is None:
                             continue
@@ -184,12 +189,8 @@ class AudioShardDataset(IterableDataset):
                             audio = audio[start : start + self.clip_samples]
                         yield audio
                 finally:
-                    if claimed is not None:
-                        claimed.unlink(missing_ok=True)
-            if not self.repeat:
-                if self.consume_shards and self.live_data_dir is not None:
-                    time.sleep(min(1.0, self.refresh_interval_sec))
-                    continue
+                    claimed.unlink(missing_ok=True)
+            if self.live_data_dir is None:
                 return
 
 

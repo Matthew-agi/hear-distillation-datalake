@@ -149,7 +149,7 @@ The generated defaults include the architecture-derived batch ceiling. A
 manual trainer block is still supported:
 
 ```bash
-TRAIN_ARGS="--device cuda --amp --repeat --shuffle-shards \
+TRAIN_ARGS="--device cuda --amp --shuffle-shards \
 --model-size small --canon --canon-2d --canon-abcd --canon-no-pos-enc \
 --max-steps 200000 --lr 3e-4 --lr-schedule cosine \
 --auto-warmup --auto-warmup-steps 1000 --gns-every 0"
@@ -165,7 +165,8 @@ editable override when one is present.
 
 ```text
 LAION-Audio streaming dataset
-  -> partitioned download and ffmpeg extraction
+  -> partitioned download into small atomic raw-MP3 shards on local NVMe
+  -> immediate ffmpeg preprocessing while later raw shards download
   -> atomic 2-second PCM16 tar shards
   -> bounded train / validation / decay curation
   -> direct masked reconstruction OR HeAR distillation
@@ -176,6 +177,7 @@ The lake layout is shared:
 
 ```text
 data/laion_audio_lake/
+  staging/      bounded raw-MP3 NVMe queue; claimed and preprocessed once
   incoming/     completed worker shards awaiting curation
   train/        bounded rolling training lake
   val/          stable hash-sampled validation reservoir
@@ -184,11 +186,18 @@ data/laion_audio_lake/
   cache/        Hugging Face cache inside the same disk budget
 ```
 
-Only completed tar files reach the trainers. Direct reconstruction treats the
-train lake as an at-most-once queue: a loader worker atomically claims a shard,
+The downloader seals a 16-source raw shard before preprocessing it and keeps at
+most four sealed raw shards queued per stream. Download and preprocessing run
+concurrently. The first training-ready shard is only 128 clips; later shards use
+the configured steady-state size. These defaults minimize time to first batch
+without reverting to just-in-time network reads.
+
+Only completed tar files reach the trainers. Both objectives treat the train
+lake as an at-most-once queue: a loader worker atomically claims a shard,
 removes it from active inventory, reads it once, and deletes it. Stale in-flight
-claims are discarded after a crash rather than replayed. Distillation retains
-its legacy reusable-lake behavior for checkpoint compatibility.
+claims are discarded after a crash rather than replayed. A live lake waits when
+the queue is empty; a finite standalone dataset fails clearly. There is no
+`--repeat` or reusable-training-data mode.
 
 ## Common controls
 
@@ -207,7 +216,8 @@ its legacy reusable-lake behavior for checkpoint compatibility.
 
 Unknown `hear-distill run` arguments pass through to the lake orchestrator.
 When `--train-extra-args` is supplied, it replaces the default trainer block;
-include the model size, Canon flags, schedule, and data-lifecycle flags you need.
+include the model size, Canon flags, and schedule you need. Training-data
+lifecycle is always fresh and cannot be overridden.
 
 Useful help surfaces:
 

@@ -60,8 +60,6 @@ def _args(data_dir: Path, out_dir: Path, max_steps: int) -> list[str]:
         "0",
         "--log-every",
         "1",
-        "--no-consume-shards",
-        "--repeat",
     ]
 
 
@@ -81,6 +79,7 @@ def test_direct_pretraining_checkpoint_and_resume(tmp_path: Path) -> None:
     assert checkpoint["adaptive_warmup_state"]["current_batch_size"] == 1
     assert checkpoint["memory_plan"]["batch_cap"] == 1
 
+    _write_audio_shard(data_dir / "shard-000001.tar")
     resume_args = _args(data_dir, out_dir, 2) + ["--resume-from", str(checkpoint_path)]
     assert main(resume_args) == 0
     resumed = torch.load(checkpoint_path, map_location="cpu", weights_only=True)

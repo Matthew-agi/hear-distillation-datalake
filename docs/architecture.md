@@ -9,6 +9,7 @@ run.sh
   -> hear-distill run            host inspection and objective/model plan
      -> datalake/run_lake.py      process supervision and shared curation
         -> stream_laion_audio_clips.py
+           -> hear_distill.data.staging raw NVMe queue
         -> distillation trainer OR reconstruction trainer
            -> hear_distill.audio cached HeAR preprocessing
            -> hear_distill.models shared Canon-ViT construction
@@ -25,23 +26,22 @@ machine and makes the calculations directly testable.
 
 ## Data plane
 
-Each streaming worker owns a deterministic Hugging Face dataset partition and
-writes tar shards through a temporary filename. Curation routes each completed
-clip to train, validation, and decay stores. The trainer uses an iterable tar
-dataset and refreshes its shard inventory while the run is active. Direct
-reconstruction atomically moves each selected train shard to an in-flight area
-before reading it, then deletes it; no shard can be claimed by a second loader
-worker or replayed after restart.
+Each streaming worker owns a deterministic Hugging Face dataset partition. A
+background thread downloads small, atomic raw-MP3 shards to local NVMe while a
+foreground thread immediately preprocesses the oldest available shard into
+PCM16 clips. Curation routes each completed clip to train, validation, and
+decay stores. Both trainers atomically move each selected train shard to an
+in-flight area before reading it, then delete it; no shard can be claimed by a
+second loader worker or replayed after restart.
 
 The reserve controller has two distinct measurements:
 
-- physical lake bytes, used for disk caps and pruning;
-- logical reserve since this invocation began. In fresh-data mode this is the
-  active, unclaimed queue, and consumption is inferred from shards actually
-  leaving that inventory rather than from the configured batch ceiling.
+- physical active-train bytes, used for disk caps and scheduling;
+- claimed bytes since this invocation began, inferred from shards actually
+  leaving the active inventory rather than from the configured batch ceiling.
 
-Separating them prevents a resumed step count from being subtracted from a lake
-whose already-consumed shards were previously pruned.
+Separating them prevents a resumed step count or an adaptive batch estimate
+from being mistaken for actual data consumption.
 
 ## Training plane
 

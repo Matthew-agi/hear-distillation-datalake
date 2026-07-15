@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """
 Stream LAION-Audio-300M from Hugging Face and write fixed-length audio clips.
 
@@ -25,6 +23,8 @@ Notes:
     remaining tail is >= 1s.
 """
 
+from __future__ import annotations
+
 import argparse
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -35,11 +35,35 @@ import re
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
-import threading
+
+try:
+  from hear_distill.data.staging import (
+    RawSourceShardWriter,
+    claim_raw_shard,
+    clean_raw_stage,
+    iter_raw_source_shard,
+    load_download_state,
+    ready_raw_shards,
+    save_download_state,
+  )
+except ModuleNotFoundError:
+  src_root = Path(__file__).resolve().parent / "src"
+  if str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+  from hear_distill.data.staging import (  # noqa: E402
+    RawSourceShardWriter,
+    claim_raw_shard,
+    clean_raw_stage,
+    iter_raw_source_shard,
+    load_download_state,
+    ready_raw_shards,
+    save_download_state,
+  )
 
 
 def _die(msg: str) -> "None":
@@ -331,6 +355,184 @@ def _save_resume_state(out_dir: Path, payload: Dict[str, Any]) -> None:
   os.replace(tmp, p)
 
 
+@dataclass
+class _DownloadStatus:
+  downloaded_seen: int = 0
+  raw_shards: int = 0
+  done: bool = False
+  error: Optional[BaseException] = None
+
+
+def _download_state_payload(
+  args: argparse.Namespace,
+  *,
+  downloaded_seen: int,
+  next_raw_shard_idx: int,
+) -> Dict[str, Any]:
+  return {
+    "downloaded_seen": int(downloaded_seen),
+    "next_raw_shard_idx": int(next_raw_shard_idx),
+    "num_streams": int(args.num_streams),
+    "stream_index": int(args.stream_index),
+    "seed": int(args.seed),
+    "shuffle_buffer": int(args.shuffle_buffer),
+    "split": str(args.split),
+    "updated_unix": int(time.time()),
+  }
+
+
+def _validate_download_state(args: argparse.Namespace, state: Dict[str, Any]) -> None:
+  expected = {
+    "num_streams": int(args.num_streams),
+    "stream_index": int(args.stream_index),
+    "seed": int(args.seed),
+    "shuffle_buffer": int(args.shuffle_buffer),
+    "split": str(args.split),
+  }
+  for key, value in expected.items():
+    if key in state and state[key] != value:
+      _die(
+        f"Refusing raw-stage resume: {key} changed from {state[key]!r} to {value!r}. "
+        "Use a fresh --raw-stage-dir."
+      )
+
+
+def _download_raw_shards(
+  args: argparse.Namespace,
+  *,
+  stage_dir: Path,
+  resume_seen: int,
+  stop_event: threading.Event,
+  status: _DownloadStatus,
+) -> None:
+  writer: Optional[RawSourceShardWriter] = None
+  try:
+    state = load_download_state(stage_dir)
+    _validate_download_state(args, state)
+    downloaded_seen = max(int(resume_seen), int(state.get("downloaded_seen", 0)))
+    raw_shard_idx = int(state.get("next_raw_shard_idx", 0))
+    status.downloaded_seen = downloaded_seen
+    stream = iter(
+      _iter_laion_stream(
+        split=args.split,
+        shuffle_buffer=args.shuffle_buffer,
+        seed=args.seed,
+        skip=downloaded_seen,
+        num_shards=args.num_streams,
+        shard_index=args.stream_index,
+        strict_partition=args.strict_partition,
+      )
+    )
+    source_exhausted = False
+    while not stop_event.is_set() and not source_exhausted:
+      while (
+        not stop_event.is_set()
+        and len(ready_raw_shards(stage_dir)) >= args.raw_prefetch_shards
+      ):
+        stop_event.wait(0.05)
+      if stop_event.is_set():
+        break
+
+      writer = RawSourceShardWriter(stage_dir, raw_shard_idx)
+      examined = 0
+      max_examined = max(args.raw_shard_size, args.raw_shard_size * 4)
+      while (
+        writer.count < args.raw_shard_size
+        and examined < max_examined
+        and not stop_event.is_set()
+      ):
+        try:
+          example = next(stream)
+        except StopIteration:
+          source_exhausted = True
+          break
+        downloaded_seen += 1
+        examined += 1
+        status.downloaded_seen = downloaded_seen
+        writer.add(downloaded_seen, example)
+
+      writer.prepare()
+      next_raw_idx = raw_shard_idx + (1 if writer.count > 0 else 0)
+      # Commit the source offset before publishing. A crash can skip an unpublished
+      # partial shard, but can never cause already staged training data to replay.
+      save_download_state(
+        stage_dir,
+        _download_state_payload(
+          args,
+          downloaded_seen=downloaded_seen,
+          next_raw_shard_idx=next_raw_idx,
+        ),
+      )
+      published = writer.publish()
+      writer = None
+      if published is not None:
+        raw_shard_idx = next_raw_idx
+        status.raw_shards += 1
+        print(
+          f"STAGE_READY path={published} downloaded_seen={downloaded_seen} "
+          f"ready={len(ready_raw_shards(stage_dir))}",
+          file=sys.stderr,
+          flush=True,
+        )
+  except BaseException as exc:  # noqa: BLE001
+    status.error = exc
+  finally:
+    if writer is not None:
+      writer.abort()
+    status.done = True
+
+
+def _iter_staged_source(
+  args: argparse.Namespace,
+  *,
+  stage_dir: Path,
+  resume_seen: int,
+) -> Iterator[Dict[str, Any]]:
+  discarded = clean_raw_stage(stage_dir)
+  if discarded:
+    print(
+      f"STAGE_DISCARDED count={discarded} reason=stale_inflight_no_replay",
+      file=sys.stderr,
+      flush=True,
+    )
+  stop_event = threading.Event()
+  status = _DownloadStatus(downloaded_seen=resume_seen)
+  downloader = threading.Thread(
+    target=_download_raw_shards,
+    kwargs={
+      "args": args,
+      "stage_dir": stage_dir,
+      "resume_seen": resume_seen,
+      "stop_event": stop_event,
+      "status": status,
+    },
+    daemon=True,
+    name=f"raw-download-{args.stream_index}",
+  )
+  downloader.start()
+  claimed: Optional[Path] = None
+  try:
+    while True:
+      claimed = claim_raw_shard(stage_dir)
+      if claimed is not None:
+        try:
+          yield from iter_raw_source_shard(claimed)
+        finally:
+          claimed.unlink(missing_ok=True)
+          claimed = None
+        continue
+      if status.done:
+        if status.error is not None:
+          raise RuntimeError(f"raw source downloader failed: {status.error}") from status.error
+        return
+      stop_event.wait(0.05)
+  finally:
+    stop_event.set()
+    if claimed is not None:
+      claimed.unlink(missing_ok=True)
+    downloader.join(timeout=5.0)
+
+
 def _parse_args() -> argparse.Namespace:
   ap = argparse.ArgumentParser(description="Stream LAION-Audio-300M and write N random fixed-length clips.")
   ap.add_argument("--out", type=Path, required=True, help="Output directory for shards.")
@@ -342,12 +544,35 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--shuffle-buffer", type=int, default=2_000, help="Shuffle buffer size for streaming (default: 2000).")
   ap.add_argument("--seed", type=int, default=1337, help="RNG seed (default: 1337).")
   ap.add_argument("--shard-size", type=int, default=1000, help="Clips per tar shard (default: 1000).")
+  ap.add_argument(
+    "--startup-shard-size",
+    type=int,
+    default=128,
+    help="Clips in the first training-ready shard for low startup latency.",
+  )
+  ap.add_argument(
+    "--raw-stage-dir",
+    type=Path,
+    default=None,
+    help="Local NVMe source stage (default: a staging sibling of --out).",
+  )
+  ap.add_argument(
+    "--raw-shard-size",
+    type=int,
+    default=16,
+    help="Downloaded MP3 examples per raw source shard.",
+  )
+  ap.add_argument(
+    "--raw-prefetch-shards",
+    type=int,
+    default=4,
+    help="Maximum sealed raw source shards waiting for preprocessing.",
+  )
   ap.add_argument("--progress-every", type=int, default=500, help="Log progress every N written clips (default: 500).")
   ap.add_argument("--ffmpeg-timeout", type=int, default=60, help="Per-example ffmpeg decode timeout seconds (default: 60).")
   ap.add_argument("--decode-workers", type=int, default=2, help="Concurrent ffmpeg decoders per stream worker.")
   ap.add_argument("--decode-prefetch", type=int, default=4, help="Maximum ordered decode tasks buffered per stream worker.")
   ap.add_argument("--min-overlap-tail-sec", type=float, default=1.0, help="Only add overlapped clip if tail >= this many seconds (default: 1.0).")
-  ap.add_argument("--max-stream-errors", type=int, default=100, help="Max streaming errors before abort (default: 100).")
   ap.add_argument("--max-examples", type=int, default=0, help="Optional cap on streamed examples (0 = no cap).")
   ap.add_argument("--resume", action="store_true", help="Resume by counting existing shards and appending new shards.")
   ap.add_argument(
@@ -386,14 +611,16 @@ def main() -> None:
     _die("--sample-rate must be > 0.")
   if args.shard_size <= 0:
     _die("--shard-size must be > 0.")
+  if args.startup_shard_size <= 0:
+    _die("--startup-shard-size must be > 0.")
+  if args.raw_shard_size <= 0 or args.raw_prefetch_shards <= 0:
+    _die("--raw-shard-size and --raw-prefetch-shards must be > 0.")
   if args.decode_workers <= 0:
     _die("--decode-workers must be > 0.")
   if args.decode_prefetch < args.decode_workers:
     _die("--decode-prefetch must be >= --decode-workers.")
   if args.min_overlap_tail_sec < 0:
     _die("--min-overlap-tail-sec must be >= 0.")
-  if args.max_stream_errors <= 0:
-    _die("--max-stream-errors must be > 0.")
   if args.num_streams <= 0:
     _die("--num-streams must be > 0.")
   if not (0 <= args.stream_index < args.num_streams):
@@ -541,9 +768,12 @@ def main() -> None:
     os.environ["HF_DATASETS_CACHE"] = str(args.datasets_cache)
 
   out_dir = args.out
+  raw_stage_dir = args.raw_stage_dir or (args.out.parent / "staging")
   if args.num_streams > 1:
     out_dir = out_dir / f"stream-{args.stream_index:03d}"
+    raw_stage_dir = raw_stage_dir / f"stream-{args.stream_index:03d}"
   out_dir.mkdir(parents=True, exist_ok=True)
+  raw_stage_dir.mkdir(parents=True, exist_ok=True)
 
   if not args.resume and not args.overwrite:
     existing = list(out_dir.glob("shard-*.tar"))
@@ -561,6 +791,12 @@ def main() -> None:
     file=sys.stderr,
   )
   print(f"Output: {out_dir} (shard_size={args.shard_size})", file=sys.stderr)
+  print(
+    f"Raw NVMe stage: {raw_stage_dir} "
+    f"(source_shard={args.raw_shard_size}, prefetch={args.raw_prefetch_shards}, "
+    f"startup_output_shard={min(args.startup_shard_size, args.shard_size)})",
+    file=sys.stderr,
+  )
   print(
     f"Decode pipeline: workers={args.decode_workers} prefetch={args.decode_prefetch}",
     file=sys.stderr,
@@ -690,14 +926,10 @@ def main() -> None:
       file=sys.stderr,
     )
 
-  stream = _iter_laion_stream(
-    split=args.split,
-    shuffle_buffer=args.shuffle_buffer,
-    seed=args.seed,
-    skip=resume_seen,
-    num_shards=args.num_streams,
-    shard_index=args.stream_index,
-    strict_partition=args.strict_partition,
+  stream = _iter_staged_source(
+    args,
+    stage_dir=raw_stage_dir,
+    resume_seen=resume_seen,
   )
 
   written = resume_written
@@ -715,6 +947,7 @@ def main() -> None:
   persisted_next_shard_idx = shard_idx
   t0 = time.perf_counter()
   last_state_save_t = 0.0
+  startup_output_pending = bool(resume_written == 0 and shard_idx == 0)
 
   def _current_written_bytes() -> int:
     total = int(written_bytes_finalized)
@@ -765,6 +998,7 @@ def main() -> None:
   def _write_results(results: Optional[List[ClipResult]]) -> None:
     nonlocal shard, shard_tmp_path, shard_final_path, shard_idx
     nonlocal written, written_bytes_finalized, in_shard, skipped
+    nonlocal startup_output_pending
     if not results:
       skipped += 1
       return
@@ -783,7 +1017,12 @@ def main() -> None:
       written += 1
       in_shard += 1
 
-      if in_shard >= args.shard_size:
+      current_shard_size = (
+        min(args.startup_shard_size, args.shard_size)
+        if startup_output_pending
+        else args.shard_size
+      )
+      if in_shard >= current_shard_size:
         _finalize_shard(shard, shard_tmp_path, shard_final_path, has_data=True)
         if shard_final_path is not None and shard_final_path.exists():
           try:
@@ -795,6 +1034,7 @@ def main() -> None:
         shard_final_path = None
         shard_idx += 1
         in_shard = 0
+        startup_output_pending = False
         _commit_finalized_state()
         _persist_state()
 
@@ -836,25 +1076,7 @@ def main() -> None:
             break
           except Exception as exc:  # noqa: BLE001
             stream_errors += 1
-            fetched_seen += 1
-            pending.append((fetched_seen, None))
-            print(f"WARN stream error: {exc} (errors={stream_errors})", file=sys.stderr)
-            if stream_errors >= args.max_stream_errors:
-              print("ERROR: too many stream errors, aborting.", file=sys.stderr)
-              source_exhausted = True
-              break
-            stream_iter = iter(
-              _iter_laion_stream(
-                split=args.split,
-                shuffle_buffer=args.shuffle_buffer,
-                seed=args.seed,
-                skip=fetched_seen,
-                num_shards=args.num_streams,
-                shard_index=args.stream_index,
-                strict_partition=args.strict_partition,
-              )
-            )
-            continue
+            raise RuntimeError(f"staged source stream failed: {exc}") from exc
 
           future = executor.submit(
             _make_clips_from_example,
@@ -885,6 +1107,9 @@ def main() -> None:
         if future is not None:
           future.cancel()
       executor.shutdown(wait=True, cancel_futures=True)
+      close_stream = getattr(stream_iter, "close", None)
+      if callable(close_stream):
+        close_stream()
   finally:
     try:
       _finalize_shard(
@@ -925,6 +1150,10 @@ def main() -> None:
     "seed": int(args.seed),
     "shuffle_buffer": int(args.shuffle_buffer),
     "shard_size": int(args.shard_size),
+    "startup_shard_size": int(min(args.startup_shard_size, args.shard_size)),
+    "raw_stage_dir": str(raw_stage_dir),
+    "raw_shard_size": int(args.raw_shard_size),
+    "raw_prefetch_shards": int(args.raw_prefetch_shards),
     "num_shards": int(shard_idx + (1 if (written > 0 and in_shard > 0) else 0)),
     "num_streams": int(args.num_streams),
     "stream_index": int(args.stream_index),
