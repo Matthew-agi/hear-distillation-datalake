@@ -70,8 +70,9 @@ Adaptive warmup is enabled by default for both objectives. It starts from the
 smallest normal probe batch under the measured ceiling, estimates critical
 batch size and critical learning rate, and holds that measurement batch fixed
 for the entire warmup. At the WSD stable-phase handoff, the selected critical
-batch is multiplied by 2x by default, rounded, clamped to the measured ceiling,
-and applied once. `--auto-warmup-batch-multiplier` changes the direct trainer's
+batch is multiplied by 2x by default, rounded up to the next power of two,
+clamped to the largest power of two within the measured ceiling, and applied
+once. `--auto-warmup-batch-multiplier` changes the direct trainer's
 multiple; distillation exposes the same policy as `--batch-opt-mult`. A real
 OOM is the safety exception: it lowers and persists the ceiling with headroom.
 
@@ -183,9 +184,11 @@ data/laion_audio_lake/
   cache/        Hugging Face cache inside the same disk budget
 ```
 
-Only completed tar files reach the trainers. New shards are discovered while
-training, and old consumed shards are pruned without crossing the reserve
-floor.
+Only completed tar files reach the trainers. Direct reconstruction treats the
+train lake as an at-most-once queue: a loader worker atomically claims a shard,
+removes it from active inventory, reads it once, and deletes it. Stale in-flight
+claims are discarded after a crash rather than replayed. Distillation retains
+its legacy reusable-lake behavior for checkpoint compatibility.
 
 ## Common controls
 
@@ -204,7 +207,7 @@ floor.
 
 Unknown `hear-distill run` arguments pass through to the lake orchestrator.
 When `--train-extra-args` is supplied, it replaces the default trainer block;
-include the model size, Canon flags, schedule, and repeat flags you need.
+include the model size, Canon flags, schedule, and data-lifecycle flags you need.
 
 Useful help surfaces:
 
@@ -255,7 +258,7 @@ src/hear_distill/
   audio.py                 shared decode and mel-PCEN preprocessing
   autotune.py              disk, worker, precision, and batch policy
   cli.py                   one-command objective selection
-  data/shards.py           reusable live tar-shard dataset
+  data/shards.py           reusable or at-most-once live tar-shard dataset
   models/canon.py          single Canon implementation
   models/memory.py         graph-derived memory measurement
   models/vit.py            tiny/small/base/large factory

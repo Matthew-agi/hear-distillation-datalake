@@ -1,4 +1,8 @@
-from datalake.run_lake import _logical_reserve_bytes, _prune_target_bytes
+from datalake.run_lake import (
+    _claimed_bytes_from_inventory,
+    _logical_reserve_bytes,
+    _prune_target_bytes,
+)
 
 
 def test_reserve_is_relative_to_run_origin_after_resume() -> None:
@@ -33,3 +37,26 @@ def test_pruning_removes_only_reserve_above_low_water_mark() -> None:
         pruned_since_origin_bytes=60,
     )
     assert reserve_after_prune == 20
+
+
+def test_fresh_consumption_comes_from_claimed_inventory_not_batch_cap() -> None:
+    assert (
+        _claimed_bytes_from_inventory(
+            origin_active_bytes=100,
+            produced_since_origin_bytes=80,
+            active_bytes=130,
+        )
+        == 50
+    )
+
+
+def test_fresh_consumption_is_monotonic_across_inventory_refreshes() -> None:
+    assert (
+        _claimed_bytes_from_inventory(
+            origin_active_bytes=100,
+            produced_since_origin_bytes=80,
+            active_bytes=140,
+            previous_claimed_bytes=50,
+        )
+        == 50
+    )

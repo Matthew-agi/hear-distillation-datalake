@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import tarfile
 import time
 from pathlib import Path
@@ -65,6 +66,30 @@ def iter_tar_pairs(tar_path: Path) -> Iterator[tuple[bytes, dict]]:
         return
 
 
+def discard_claimed_shards(claim_dir: Path) -> int:
+    """Discard shards claimed by an earlier process so they can never be replayed."""
+    if not claim_dir.exists():
+        claim_dir.mkdir(parents=True, exist_ok=True)
+        return 0
+    discarded = sum(1 for path in claim_dir.rglob("*.tar") if path.is_file())
+    shutil.rmtree(claim_dir)
+    claim_dir.mkdir(parents=True, exist_ok=True)
+    return discarded
+
+
+def _claim_shard(shard: Path, claim_dir: Path, worker_id: int) -> Path | None:
+    """Atomically remove one shard from the shared train inventory."""
+    claim_dir.mkdir(parents=True, exist_ok=True)
+    claimed = claim_dir / (
+        f"{shard.parent.name}-{shard.stem}-w{worker_id}-p{os.getpid()}-{time.time_ns()}.tar"
+    )
+    try:
+        shard.replace(claimed)
+    except (FileNotFoundError, OSError):
+        return None
+    return claimed
+
+
 class AudioShardDataset(IterableDataset):
     """Fixed-length clips with live discovery of newly curated shards."""
 
@@ -81,6 +106,8 @@ class AudioShardDataset(IterableDataset):
         shards_glob: str = "shard-*.tar",
         streams_glob: str = "stream-*",
         refresh_interval_sec: float = 30.0,
+        consume_shards: bool = False,
+        claim_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self.shards = list(shards)
@@ -93,7 +120,11 @@ class AudioShardDataset(IterableDataset):
         self.shards_glob = shards_glob
         self.streams_glob = streams_glob
         self.refresh_interval_sec = max(1.0, float(refresh_interval_sec))
+        self.consume_shards = bool(consume_shards)
+        self.claim_dir = claim_dir
         self._last_refresh = 0.0
+        if self.consume_shards and self.claim_dir is None:
+            raise ValueError("claim_dir is required when consume_shards is enabled.")
 
     def _current_shards(self) -> list[Path]:
         if self.live_data_dir is None:
@@ -115,9 +146,16 @@ class AudioShardDataset(IterableDataset):
         rng = random.Random(self.seed + worker_id)
 
         while True:
-            shards = self._current_shards()[worker_id::worker_count]
+            if self.consume_shards and self.live_data_dir is not None:
+                shards = discover_shards(
+                    self.live_data_dir, self.shards_glob, self.streams_glob
+                )
+            else:
+                shards = self._current_shards()
+            if not self.consume_shards:
+                shards = shards[worker_id::worker_count]
             if not shards:
-                if not self.repeat:
+                if not self.repeat and self.live_data_dir is None:
                     return
                 time.sleep(min(2.0, self.refresh_interval_sec))
                 continue
@@ -125,20 +163,39 @@ class AudioShardDataset(IterableDataset):
             if self.shuffle_shards:
                 rng.shuffle(order)
             for shard in order:
-                for wav_bytes, _metadata in iter_tar_pairs(shard):
-                    audio = decode_wav_bytes(wav_bytes, self.sample_rate)
-                    if audio is None:
+                claimed = None
+                if self.consume_shards:
+                    assert self.claim_dir is not None
+                    claimed = _claim_shard(shard, self.claim_dir, worker_id)
+                    if claimed is None:
                         continue
-                    if audio.numel() < self.clip_samples:
-                        audio = torch.nn.functional.pad(
-                            audio, (0, self.clip_samples - audio.numel())
-                        )
-                    elif audio.numel() > self.clip_samples:
-                        start = rng.randint(0, audio.numel() - self.clip_samples)
-                        audio = audio[start : start + self.clip_samples]
-                    yield audio
+                    shard = claimed
+                try:
+                    for wav_bytes, _metadata in iter_tar_pairs(shard):
+                        audio = decode_wav_bytes(wav_bytes, self.sample_rate)
+                        if audio is None:
+                            continue
+                        if audio.numel() < self.clip_samples:
+                            audio = torch.nn.functional.pad(
+                                audio, (0, self.clip_samples - audio.numel())
+                            )
+                        elif audio.numel() > self.clip_samples:
+                            start = rng.randint(0, audio.numel() - self.clip_samples)
+                            audio = audio[start : start + self.clip_samples]
+                        yield audio
+                finally:
+                    if claimed is not None:
+                        claimed.unlink(missing_ok=True)
             if not self.repeat:
+                if self.consume_shards and self.live_data_dir is not None:
+                    time.sleep(min(1.0, self.refresh_interval_sec))
+                    continue
                 return
 
 
-__all__ = ["AudioShardDataset", "discover_shards", "iter_tar_pairs"]
+__all__ = [
+    "AudioShardDataset",
+    "discard_claimed_shards",
+    "discover_shards",
+    "iter_tar_pairs",
+]

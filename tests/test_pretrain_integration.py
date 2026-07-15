@@ -60,6 +60,8 @@ def _args(data_dir: Path, out_dir: Path, max_steps: int) -> list[str]:
         "0",
         "--log-every",
         "1",
+        "--no-consume-shards",
+        "--repeat",
     ]
 
 

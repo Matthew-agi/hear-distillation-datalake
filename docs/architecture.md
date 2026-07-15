@@ -28,13 +28,17 @@ machine and makes the calculations directly testable.
 Each streaming worker owns a deterministic Hugging Face dataset partition and
 writes tar shards through a temporary filename. Curation routes each completed
 clip to train, validation, and decay stores. The trainer uses an iterable tar
-dataset and refreshes its shard inventory while the run is active.
+dataset and refreshes its shard inventory while the run is active. Direct
+reconstruction atomically moves each selected train shard to an in-flight area
+before reading it, then deletes it; no shard can be claimed by a second loader
+worker or replayed after restart.
 
 The reserve controller has two distinct measurements:
 
 - physical lake bytes, used for disk caps and pruning;
-- logical reserve since this invocation began, computed as initial reserve plus
-  new production minus new training consumption and in-run pruning.
+- logical reserve since this invocation began. In fresh-data mode this is the
+  active, unclaimed queue, and consumption is inferred from shards actually
+  leaving that inventory rather than from the configured batch ceiling.
 
 Separating them prevents a resumed step count from being subtracted from a lake
 whose already-consumed shards were previously pruned.
@@ -55,9 +59,9 @@ Both trainers default to adaptive warmup. The model graph supplies a memory
 ceiling, the direct trainer calibrates it with live CUDA allocations, and the
 standalone adaptive-warmup controller selects critical batch and LR within that
 ceiling. The loader batch remains fixed while those measurements are collected;
-the default 2x WSD batch multiple is applied once at the transition to stable
-training. OOM feedback is the only warmup-time batch change, moves the ceiling
-downward, and is checkpointed.
+the default 2x WSD batch multiple is rounded up to a power of two and applied
+once at the transition to stable training. OOM feedback is the only warmup-time
+batch change, moves the ceiling downward, and is checkpointed.
 
 ## Compatibility boundary
 

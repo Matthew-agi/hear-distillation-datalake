@@ -76,7 +76,6 @@ def _train_defaults(
         str(max_steps),
         "--model-size",
         model_size,
-        "--repeat",
         "--shuffle-shards",
         "--canon",
         "--canon-2d",
@@ -92,6 +91,8 @@ def _train_defaults(
         "--gns-every",
         "0",
     ]
+    if objective != "reconstruct":
+        tokens.append("--repeat")
     warmup_steps = min(1000, max(1, max_steps // 10))
     tokens.extend(("--auto-warmup-steps", str(warmup_steps)))
     if objective == "distill":
@@ -164,6 +165,8 @@ def _run(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     _append_default(command, passthrough, "--curation-shard-size", plan.shard_size)
     _append_default(command, passthrough, "--train-batch-size", plan.train_batch_size)
     _append_default(command, passthrough, "--train-num-workers", plan.train_num_workers)
+    if args.objective == "reconstruct" and not _has_option(passthrough, "--fresh-data"):
+        command.append("--fresh-data")
     if not _has_option(passthrough, "--train-extra-args"):
         train_tokens = _train_defaults(
             objective=args.objective,
