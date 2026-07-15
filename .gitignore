@@ -17,7 +17,7 @@ env/
 .env
 
 # Artifacts
-data/
+/data/
 cache/
 checkpoints/
 wandb/
