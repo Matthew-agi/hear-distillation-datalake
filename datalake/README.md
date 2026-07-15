@@ -28,7 +28,7 @@ The lake has five areas:
 - `incoming/`: completed streamer shards awaiting curation;
 - `train/`: bounded rolling training lake;
 - `val/`: stable hash-sampled validation reservoir;
-- `decay/`: bounded sample retained for the final decay phase.
+- `decay/`: bounded final-phase holdout excluded from stable training.
 
 Each stream downloader seals a small raw shard and immediately makes it
 available to concurrent ffmpeg preprocessing. The first PCM training shard is
@@ -40,3 +40,6 @@ curation manifests, and checkpoints are written atomically. Train shards are
 claimed and deleted after one read; an empty live queue waits instead of
 replaying old samples. Free-space and lake caps pause new stream chunks;
 hysteresis prevents rapid worker churn.
+
+Train, validation, and WSD decay routing is mutually exclusive. In particular,
+the decay store is not a copy of stable-phase training data.

@@ -29,8 +29,8 @@ machine and makes the calculations directly testable.
 Each streaming worker owns a deterministic Hugging Face dataset partition. A
 background thread downloads small, atomic raw-MP3 shards to local NVMe while a
 foreground thread immediately preprocesses the oldest available shard into
-PCM16 clips. Curation routes each completed clip to train, validation, and
-decay stores. Both trainers atomically move each selected train shard to an
+PCM16 clips. Curation routes each completed clip to exactly one of train,
+validation, or WSD decay. Both trainers atomically move each selected train shard to an
 in-flight area before reading it, then delete it; no shard can be claimed by a
 second loader worker or replayed after restart.
 

@@ -769,6 +769,22 @@ def _load_curation_state(
 ) -> Dict:
   raw = _load_json(path)
   state = raw if isinstance(raw, dict) else {}
+  if state.get("decay_split_mode") != "exclusive_v1":
+    discarded_legacy_decay = 0
+    for shard in _discover_final_shards(decay_lake_dir):
+      try:
+        shard.unlink()
+        discarded_legacy_decay += 1
+      except FileNotFoundError:
+        continue
+    state["decay_active"] = []
+    state["decay_next_shard"] = 0
+    state["decay_seen_candidates"] = 0
+    state["decay_replacements"] = 0
+    state["decay_replacements_since_compaction"] = 0
+    state["decay_compactions"] = 0
+    state["decay_split_mode"] = "exclusive_v1"
+    state["discarded_legacy_decay_shards"] = discarded_legacy_decay
   train_next = state.get("train_next_shard_by_stream")
   if not isinstance(train_next, dict):
     train_next = _next_train_shard_indices(train_lake_dir, num_streams=num_streams)
@@ -1188,6 +1204,14 @@ def main() -> None:
     val_capacity_entries=val_capacity_entries,
     decay_max_entries=decay_max_entries,
   )
+  discarded_legacy_decay = int(curation_state.get("discarded_legacy_decay_shards", 0))
+  if discarded_legacy_decay:
+    print(
+      f"[lake] discarded legacy copied decay shards={discarded_legacy_decay}; "
+      "new decay data is an exclusive holdout",
+      flush=True,
+    )
+    curation_state["discarded_legacy_decay_shards"] = 0
   _write_json_atomic(val_manifest_path, _manifest_payload(curation_state["val_active"], max_bytes=val_max_bytes))
   _write_json_atomic(decay_manifest_path, _manifest_payload(curation_state["decay_active"], max_bytes=decay_max_bytes))
   _write_curation_state(curation_state_file, curation_state)
@@ -1600,14 +1624,7 @@ def main() -> None:
       if routed_to_val:
         continue
 
-      if train_writer is None:
-        train_next = int(curation_state["train_next_shard_by_stream"].get(str(stream_idx), 0))
-        train_writer = _TarShardWriter(train_stream_dir, train_next)
-        curation_state["train_next_shard_by_stream"][str(stream_idx)] = train_next + 1
-      train_writer.write(stem, wav_bytes, json_bytes)
-      curation_state["train_committed_clips"] = int(curation_state["train_committed_clips"]) + 1
-      curation_state["train_committed_member_bytes"] = int(curation_state["train_committed_member_bytes"]) + clip_nbytes
-
+      routed_to_decay = False
       if args.decay_retain_ratio > 0.0 and decay_capacity > 0:
         curation_state["decay_seen_candidates"] = int(curation_state["decay_seen_candidates"]) + 1
         decay_score = _stable_score("decay", clip_id, seed=2026 + args.num_streams)
@@ -1636,6 +1653,17 @@ def main() -> None:
                 "score": decay_score,
               }
             )
+            routed_to_decay = True
+      if routed_to_decay:
+        continue
+
+      if train_writer is None:
+        train_next = int(curation_state["train_next_shard_by_stream"].get(str(stream_idx), 0))
+        train_writer = _TarShardWriter(train_stream_dir, train_next)
+        curation_state["train_next_shard_by_stream"][str(stream_idx)] = train_next + 1
+      train_writer.write(stem, wav_bytes, json_bytes)
+      curation_state["train_committed_clips"] = int(curation_state["train_committed_clips"]) + 1
+      curation_state["train_committed_member_bytes"] = int(curation_state["train_committed_member_bytes"]) + clip_nbytes
 
     for writer in (train_writer, val_writer, decay_writer):
       if writer is None:

@@ -181,7 +181,7 @@ data/laion_audio_lake/
   incoming/     completed worker shards awaiting curation
   train/        bounded rolling training lake
   val/          stable hash-sampled validation reservoir
-  decay/        bounded final-phase sample
+  decay/        bounded final-phase holdout, never seen during stable training
   manifests/    atomic active-set and curation state
   cache/        Hugging Face cache inside the same disk budget
 ```
@@ -198,6 +198,11 @@ removes it from active inventory, reads it once, and deletes it. Stale in-flight
 claims are discarded after a crash rather than replayed. A live lake waits when
 the queue is empty; a finite standalone dataset fails clearly. There is no
 `--repeat` or reusable-training-data mode.
+
+Validation and WSD decay clips are mutually exclusive holdouts from the same
+stream. Decay clips are not copied into the stable train lake, so the decay
+phase also sees each training example for the first time. On upgrade, legacy
+decay shards that may contain copied stable-phase examples are discarded.
 
 ## Common controls
 
