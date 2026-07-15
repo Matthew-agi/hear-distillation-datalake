@@ -15,6 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from adaptive_warmup import (
+    AdaptiveProbeError,
     AdaptiveWarmup,
     WarmupConfig,
     estimate_critical_learning_rate,
@@ -765,6 +766,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                     torch.cuda.empty_cache()
                 print(
                     "Warning: adaptive metric probe exceeded memory; "
+                    "skipping this measurement while preserving the real step.",
+                    flush=True,
+                )
+            except AdaptiveProbeError as error:
+                print(
+                    f"Warning: adaptive metric probe was numerically unresolved ({error}); "
                     "skipping this measurement while preserving the real step.",
                     flush=True,
                 )

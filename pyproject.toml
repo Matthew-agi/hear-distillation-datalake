@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
-  "adaptive-warmup @ git+https://github.com/Matthew-agi/adaptive-warmup.git@a009641c7705bbe2ba2a42d97d1a3a9febb2d89b",
+  "adaptive-warmup @ git+https://github.com/Matthew-agi/adaptive-warmup.git@755957ccfaa1ac8cfe332a1cbdabbd3150e5b0d1",
   "datasets>=3.0",
   "hf-transfer>=0.1.9",
   "huggingface-hub>=0.29",
