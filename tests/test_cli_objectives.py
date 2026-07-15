@@ -29,4 +29,6 @@ def test_reconstruction_dry_run_selects_new_trainer_and_model(
     assert "--model-size large" in output
     assert "--auto-warmup" in output
     assert "--auto-warmup-max-batch-size" in output
+    assert "--lr-schedule none" in output
+    assert "cosine" not in output
     assert "--optimizer-mode teacher-superbatch" not in output

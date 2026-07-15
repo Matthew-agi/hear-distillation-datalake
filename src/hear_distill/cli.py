@@ -85,7 +85,7 @@ def _train_defaults(
         "--lr",
         "3e-4",
         "--lr-schedule",
-        "cosine",
+        "none",
         "--auto-warmup",
         "--auto-warmup-max-batch-size",
         str(batch_cap),

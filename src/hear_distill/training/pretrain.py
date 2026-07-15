@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import math
 import random
 import re
 import time
@@ -113,7 +112,7 @@ def _parser() -> argparse.ArgumentParser:
         help="Step where phase-local decay begins; managed by the lake decay phase.",
     )
     parser.add_argument("--lr-min-ratio", type=float, default=0.1)
-    parser.add_argument("--lr-schedule", choices=("none", "cosine", "linear"), default="cosine")
+    parser.add_argument("--lr-schedule", choices=("none", "linear"), default="none")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--amp-dtype", choices=("auto", "float16", "bfloat16"), default="auto")
@@ -236,13 +235,32 @@ def _lr_at_step(args: argparse.Namespace, step: int) -> float:
     )
     decay_steps = max(1, args.max_steps - schedule_start)
     progress = min(1.0, max(0.0, (step - schedule_start) / decay_steps))
-    if args.lr_schedule == "linear":
-        factor = 1.0 - (1.0 - args.lr_min_ratio) * progress
-    else:
-        factor = args.lr_min_ratio + (1.0 - args.lr_min_ratio) * 0.5 * (
-            1.0 + math.cos(math.pi * progress)
-        )
+    factor = 1.0 - (1.0 - args.lr_min_ratio) * progress
     return args.lr * factor
+
+
+def _adaptive_lr_at_step(
+    args: argparse.Namespace,
+    *,
+    step: int,
+    warmup_lr: float,
+) -> float:
+    """Apply a phase-local schedule without losing the adaptive warmup result."""
+
+    if args.lr_schedule == "none":
+        return warmup_lr
+    schedule_start = (
+        args.lr_schedule_start_step
+        if args.lr_schedule_start_step > 0
+        else args.auto_warmup_steps
+    )
+    if step <= schedule_start:
+        return args.lr if args.lr_schedule_start_step > 0 else warmup_lr
+    decay_steps = max(1, args.max_steps - schedule_start)
+    progress = min(1.0, max(0.0, (step - schedule_start) / decay_steps))
+    base_lr = args.lr if args.lr_schedule_start_step > 0 else warmup_lr
+    factor = 1.0 - (1.0 - args.lr_min_ratio) * progress
+    return base_lr * factor
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -541,7 +559,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             warmup.load_state_dict(warmup_state)
             current_batch_size = warmup.current_batch_size
-            set_reference_lr(optimizer, warmup.current_lr)
+            resume_lr = (
+                args.lr
+                if args.lr_schedule_start_step > 0
+                else warmup.current_lr
+            )
+            set_reference_lr(optimizer, resume_lr)
             loader = _make_loader(
                 dataset,
                 batch_size=current_batch_size,
@@ -663,28 +686,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         with autocast_context():
             return model(spectrogram, mask).loss
 
-    def adaptive_decay_lr(train_step: int) -> float:
-        assert warmup is not None
-        if train_step <= args.auto_warmup_steps:
-            return warmup.current_lr
-        progress = min(
-            1.0,
-            max(
-                0.0,
-                (train_step - args.auto_warmup_steps)
-                / max(1, args.max_steps - args.auto_warmup_steps),
-            ),
-        )
-        if args.lr_schedule == "none":
-            factor = 1.0
-        elif args.lr_schedule == "linear":
-            factor = 1.0 - (1.0 - args.lr_min_ratio) * progress
-        else:
-            factor = args.lr_min_ratio + (1.0 - args.lr_min_ratio) * 0.5 * (
-                1.0 + math.cos(math.pi * progress)
-            )
-        return warmup.current_lr * factor
-
     optimizer.zero_grad(set_to_none=True)
     running_loss = 0.0
     latest_adaptive_metrics: dict[str, float] = {}
@@ -692,7 +693,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     while step < args.max_steps:
         step += 1
         step_loss = 0.0
-        lr = adaptive_decay_lr(step) if warmup is not None else _lr_at_step(args, step)
+        lr = (
+            _adaptive_lr_at_step(args, step=step, warmup_lr=warmup.current_lr)
+            if warmup is not None
+            else _lr_at_step(args, step)
+        )
         set_reference_lr(optimizer, lr)
         try:
             for _micro_step in range(args.grad_accum):

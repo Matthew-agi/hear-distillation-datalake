@@ -151,7 +151,7 @@ manual trainer block is still supported:
 ```bash
 TRAIN_ARGS="--device cuda --amp --shuffle-shards \
 --model-size small --canon --canon-2d --canon-abcd --canon-no-pos-enc \
---max-steps 200000 --lr 3e-4 --lr-schedule cosine \
+--max-steps 200000 --lr 3e-4 --lr-schedule none \
 --auto-warmup --auto-warmup-steps 1000 --gns-every 0"
 
 ./run.sh --objective distill --train-extra-args "$TRAIN_ARGS"

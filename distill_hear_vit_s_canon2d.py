@@ -525,10 +525,10 @@ def _parse_args() -> argparse.Namespace:
   ap.add_argument("--num-workers", type=int, default=4, help="DataLoader workers.")
   ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device.")
   ap.add_argument("--lr", type=float, default=3e-5, help="Learning rate.")
-  ap.add_argument("--lr-schedule", type=str, default="none", choices=["none", "cosine", "linear"], help="LR schedule.")
+  ap.add_argument("--lr-schedule", type=str, default="none", choices=["none", "linear"], help="Constant stable LR or phase-local linear decay.")
   ap.add_argument("--lr-schedule-start-step", type=int, default=0, help="Global step at which LR scheduling begins (used for resumed phase-local decay).")
   ap.add_argument("--lr-warmup-steps", type=int, default=0, help="Linear warmup steps for LR.")
-  ap.add_argument("--lr-min-ratio", type=float, default=0.1, help="Final LR ratio for cosine schedule.")
+  ap.add_argument("--lr-min-ratio", type=float, default=0.1, help="Final LR ratio for phase-local decay.")
   ap.add_argument(
     "--auto-warmup",
     action=argparse.BooleanOptionalAction,
@@ -1336,17 +1336,10 @@ def _lr_multiplier(
     return float(step) / float(max(1, warmup_steps))
   if schedule == "none":
     return 1.0
-  if schedule == "cosine":
+  if schedule == "linear":
     denom = max(1, max_steps - warmup_steps)
     progress = min(1.0, max(0.0, float(step - warmup_steps) / float(denom)))
-    cos_term = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return float(min_ratio + (1.0 - min_ratio) * cos_term)
-  if schedule == "linear":
-    if max_steps <= warmup_steps + 1:
-      return 0.0
-    denom = max(1, max_steps - warmup_steps - 1)
-    progress = min(1.0, max(0.0, float(step - warmup_steps - 1) / float(denom)))
-    return float(max(0.0, 1.0 - progress))
+    return float(min_ratio + (1.0 - min_ratio) * (1.0 - progress))
   return 1.0
 
 
@@ -3104,9 +3097,14 @@ def main() -> None:
       if auto_warmup_handoff_batch_size is None:
         auto_warmup_handoff_batch_size = int(current_train_batch)
       lr_gns_ref_batch = _resolve_lr_gns_ref_batch(current_train_batch)
-      schedule_step = max(0, step - args.auto_warmup_steps)
-      schedule_max_steps = max(1, args.max_steps - args.auto_warmup_steps)
-      base_lr = float(auto_warmup_handoff_lr) * _lr_multiplier(
+      schedule_start_step = max(0, int(args.lr_schedule_start_step))
+      phase_start = schedule_start_step or args.auto_warmup_steps
+      schedule_step = max(0, (step + 1) - phase_start)
+      schedule_max_steps = max(1, args.max_steps - phase_start)
+      schedule_base_lr = (
+        args.lr if schedule_start_step > 0 else float(auto_warmup_handoff_lr)
+      )
+      base_lr = schedule_base_lr * _lr_multiplier(
         step=schedule_step,
         max_steps=schedule_max_steps,
         schedule=args.lr_schedule,
