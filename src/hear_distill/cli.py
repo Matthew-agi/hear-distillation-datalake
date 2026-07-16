@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 from .autotune import build_runtime_plan, inspect_host
+from .models.memory import rounded_initial_batch
 
 
 def _repo_root() -> Path:
@@ -59,13 +60,23 @@ def _redact_command(tokens: Iterable[str]) -> str:
     return shlex.join(result)
 
 
-def _train_defaults(*, device: str, amp: bool, teacher_batch_factor: int, max_steps: int) -> list[str]:
+def _train_defaults(
+    *,
+    objective: str,
+    model_size: str,
+    device: str,
+    amp: bool,
+    teacher_batch_factor: int,
+    batch_cap: int,
+    max_steps: int,
+) -> list[str]:
     tokens = [
         "--device",
         device,
         "--max-steps",
         str(max_steps),
-        "--repeat",
+        "--model-size",
+        model_size,
         "--shuffle-shards",
         "--canon",
         "--canon-2d",
@@ -74,16 +85,22 @@ def _train_defaults(*, device: str, amp: bool, teacher_batch_factor: int, max_st
         "--lr",
         "3e-4",
         "--lr-schedule",
-        "cosine",
+        "none",
+        "--auto-warmup",
+        "--auto-warmup-max-batch-size",
+        str(batch_cap),
         "--gns-every",
         "0",
     ]
-    warmup_steps = min(500, max_steps // 20)
-    if warmup_steps > 0:
-        tokens.extend(("--lr-warmup-steps", str(warmup_steps)))
+    warmup_steps = min(1000, max(1, max_steps // 10))
+    tokens.extend(("--auto-warmup-steps", str(warmup_steps)))
+    if objective == "distill":
+        tokens.extend(
+            ("--auto-warmup-probe-batch-size", str(rounded_initial_batch(batch_cap)))
+        )
     if amp:
         tokens.append("--amp")
-    if teacher_batch_factor > 1:
+    if objective == "distill" and teacher_batch_factor > 1:
         tokens.extend(
             (
                 "--optimizer-mode",
@@ -99,10 +116,20 @@ def _run(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     repo_root = _repo_root()
     data_dir = (repo_root / args.data_dir).resolve() if not args.data_dir.is_absolute() else args.data_dir.resolve()
     resources = inspect_host(data_dir)
-    plan = build_runtime_plan(resources, disk_fraction=args.disk_fraction)
+    plan = build_runtime_plan(
+        resources,
+        disk_fraction=args.disk_fraction,
+        model_size=args.model_size,
+        objective=args.objective,
+    )
     os.environ.setdefault("HF_HOME", str(data_dir / "cache" / "huggingface"))
 
-    if not args.dry_run and not args.skip_auth_check and not _hf_token_available():
+    if (
+        args.objective == "distill"
+        and not args.dry_run
+        and not args.skip_auth_check
+        and not _hf_token_available()
+    ):
         raise SystemExit(
             "HeAR model access requires a Hugging Face login and acceptance of the model terms.\n"
             "Accept https://huggingface.co/google/hear-pytorch, run `.venv/bin/hf auth login`, then retry.\n"
@@ -110,9 +137,21 @@ def _run(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
         )
 
     command: list[str] = [sys.executable, str(repo_root / "datalake" / "run_lake.py")]
+    train_script = (
+        Path("scripts/train/distill.py")
+        if args.objective == "distill"
+        else Path("scripts/train/pretrain_reconstruction.py")
+    )
+    train_out = args.train_out or (
+        Path("checkpoints/hear_vit_s_lake")
+        if args.objective == "distill"
+        else Path("checkpoints/canon_audio_pretrain")
+    )
     _append_default(command, passthrough, "--repo-root", repo_root)
+    _append_default(command, passthrough, "--python", sys.executable)
     _append_default(command, passthrough, "--data-dir", args.data_dir)
-    _append_default(command, passthrough, "--train-out", args.train_out)
+    _append_default(command, passthrough, "--train-out", train_out)
+    _append_default(command, passthrough, "--train-script", train_script)
     _append_default(command, passthrough, "--num-streams", plan.num_streams)
     _append_default(command, passthrough, "--min-streams", plan.min_streams)
     _append_default(command, passthrough, "--lake-max-gb", plan.lake_max_gib)
@@ -129,9 +168,12 @@ def _run(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     _append_default(command, passthrough, "--train-num-workers", plan.train_num_workers)
     if not _has_option(passthrough, "--train-extra-args"):
         train_tokens = _train_defaults(
+            objective=args.objective,
+            model_size=args.model_size,
             device=plan.device,
             amp=plan.amp,
             teacher_batch_factor=plan.teacher_batch_factor,
+            batch_cap=plan.train_batch_size,
             max_steps=args.max_steps,
         )
         command.extend(("--train-extra-args", shlex.join(train_tokens)))
@@ -139,6 +181,7 @@ def _run(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
 
     print(
         "[auto] "
+        f"objective={args.objective} model={args.model_size} "
         f"cpu={resources.cpu_count} gpu={resources.gpu_name or 'none'} "
         f"gpu_mem={resources.gpu_memory_gib:.1f}GiB "
         f"disk={resources.disk_total_gib:.1f}GiB free={resources.disk_free_gib:.1f}GiB "
@@ -148,7 +191,8 @@ def _run(args: argparse.Namespace, passthrough: Sequence[str]) -> int:
     print(
         "[auto] "
         f"streams={plan.min_streams}-{plan.num_streams} loader_workers={plan.train_num_workers} "
-        f"batch={plan.train_batch_size} amp={int(plan.amp)} lake={plan.lake_max_gib:.1f}GiB "
+        f"batch_cap={plan.train_batch_size} adaptive_batch=1 amp={int(plan.amp)} "
+        f"lake={plan.lake_max_gib:.1f}GiB "
         f"hf_cache={os.environ['HF_HOME']}",
         flush=True,
     )
@@ -200,8 +244,18 @@ def _doctor(args: argparse.Namespace) -> int:
 def _defaults(args: argparse.Namespace) -> int:
     path = args.path.resolve()
     resources = inspect_host(path)
-    plan = build_runtime_plan(resources, disk_fraction=args.disk_fraction)
-    payload = {"host": asdict(resources), "plan": asdict(plan)}
+    plan = build_runtime_plan(
+        resources,
+        disk_fraction=args.disk_fraction,
+        model_size=args.model_size,
+        objective=args.objective,
+    )
+    payload = {
+        "objective": args.objective,
+        "model_size": args.model_size,
+        "host": asdict(resources),
+        "plan": asdict(plan),
+    }
     print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
 
@@ -211,10 +265,17 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     run = subparsers.add_parser("run", help="Auto-tune and start streaming + training.")
+    run.add_argument(
+        "--objective",
+        choices=("distill", "reconstruct"),
+        default="distill",
+        help="Teacher distillation or direct masked-spectrogram pretraining.",
+    )
+    run.add_argument("--model-size", choices=("tiny", "small", "base", "large"), default="small")
     run.add_argument("--disk-fraction", type=float, default=0.5)
     run.add_argument("--max-steps", type=int, default=200_000)
     run.add_argument("--data-dir", type=Path, default=Path("data/laion_audio_lake"))
-    run.add_argument("--train-out", type=Path, default=Path("checkpoints/hear_vit_s_lake"))
+    run.add_argument("--train-out", type=Path, default=None)
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--skip-auth-check", action="store_true")
 
@@ -224,6 +285,8 @@ def _parser() -> argparse.ArgumentParser:
     defaults = subparsers.add_parser("defaults", help="Print the resolved hardware-aware plan.")
     defaults.add_argument("--path", type=Path, default=Path.cwd())
     defaults.add_argument("--disk-fraction", type=float, default=0.5)
+    defaults.add_argument("--objective", choices=("distill", "reconstruct"), default="distill")
+    defaults.add_argument("--model-size", choices=("tiny", "small", "base", "large"), default="small")
     return parser
 
 

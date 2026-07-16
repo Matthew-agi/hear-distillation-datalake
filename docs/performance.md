@@ -20,11 +20,12 @@ clip to PCM16 for WAV storage. It now asks ffmpeg for PCM16 directly and wraps
 byte slices in WAV headers. Training recognizes this canonical WAV layout and
 decodes it without libsndfile.
 
-Each dataset partition also has a bounded ordered decode queue. Dataset reads
-can continue while two ffmpeg processes decode prior rows, but results are
-committed in source order so the persisted resume offset never jumps past
-unfinished work. The auto-tuner bounds the aggregate shuffle buffer across all
-stream processes because those buffers contain the full embedded MP3 payloads.
+Each dataset partition first seals small raw-MP3 tar shards on local NVMe. A
+foreground consumer claims the first shard immediately and feeds a bounded,
+ordered ffmpeg queue while the background downloader fills later shards. The
+first PCM shard is smaller than steady state so curation and training can begin
+quickly. Raw and decoded claims are at-most-once; stale in-flight work is
+discarded rather than replayed.
 
 HeAR mel-PCEN preprocessing is now self-contained. The Hann window and mel
 projection are buffers rather than per-batch allocations. The PCEN smoother is
@@ -39,7 +40,7 @@ Use the built-in diagnostic mode for a representative run:
 
 ```bash
 ./run.sh \
-  --train-extra-args "--device cuda --amp --repeat --gns-every 0 --optimizer-mode diagnostic --optimizer-log-every 20"
+  --train-extra-args "--device cuda --amp --gns-every 0 --optimizer-mode diagnostic --optimizer-log-every 20"
 ```
 
 The trainer reports loader wait, host-to-device transfer, preprocessing,

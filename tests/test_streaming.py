@@ -25,7 +25,13 @@ def test_pcm_wrapper_writes_valid_wav() -> None:
 
 
 def test_parallel_decode_pipeline_preserves_source_order(tmp_path, monkeypatch) -> None:
-    examples = [{"__key__": f"item-{index}"} for index in range(6)]
+    examples = [
+        {
+            "__key__": f"item-{index}",
+            "audio.mp3": {"bytes": f"mp3-{index}".encode(), "path": ""},
+        }
+        for index in range(6)
+    ]
 
     def fake_stream(**_kwargs):
         return iter(examples)
@@ -46,6 +52,8 @@ def test_parallel_decode_pipeline_preserves_source_order(tmp_path, monkeypatch) 
             "stream_laion_audio_clips.py",
             "--out",
             str(tmp_path),
+            "--raw-stage-dir",
+            str(tmp_path / "raw"),
             "--num-clips",
             "6",
             "--shard-size",
@@ -64,3 +72,6 @@ def test_parallel_decode_pipeline_preserves_source_order(tmp_path, monkeypatch) 
     assert wav_names == [f"item-{index}.wav" for index in range(6)]
     state = json.loads((tmp_path / "resume_state.json").read_text())
     assert state["seen"] == 6
+    download_state = json.loads((tmp_path / "raw" / "download_state.json").read_text())
+    assert download_state["downloaded_seen"] == 6
+    assert list((tmp_path / "raw").glob("source-*.tar")) == []
